@@ -1,0 +1,46 @@
+[package]
+name = "skim"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A terminal RSS reader that fetches clean article content via jina.ai"
+repository = "https://github.com/dhofheinz/skim"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# HTTP
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# Database (async SQLite)
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
+# Feed parsing
+feed-rs = "2"
+quick-xml = { version = "0.37", features = ["serde", "serialize"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Markdown rendering
+pulldown-cmark = "0.12"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Utilities
+sha2 = "0.10"
+open = "5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
