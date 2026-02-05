@@ -167,24 +167,25 @@ pub async fn fetch_content(
     // 3. No selector (let jina.ai extract full page)
 
     // First attempt: semantic content selectors
-    let content: Option<()> = match fetch_with_retry(client, &jina_url, Some(TARGET_SELECTORS)).await {
-        Ok(content) if content.len() >= MIN_CONTENT_LEN => {
-            return Ok(strip_boilerplate(&content));
-        }
-        Ok(content) => {
-            tracing::debug!(
-                content_len = content.len(),
-                "Semantic selectors returned minimal content, trying fallback"
-            );
-            // Fall through to try fallback selector
-            None
-        }
-        Err(ContentError::HttpStatus(422)) => {
-            tracing::debug!("Semantic selectors caused 422, trying fallback selector");
-            None
-        }
-        Err(e) => return Err(e),
-    };
+    let content: Option<()> =
+        match fetch_with_retry(client, &jina_url, Some(TARGET_SELECTORS)).await {
+            Ok(content) if content.len() >= MIN_CONTENT_LEN => {
+                return Ok(strip_boilerplate(&content));
+            }
+            Ok(content) => {
+                tracing::debug!(
+                    content_len = content.len(),
+                    "Semantic selectors returned minimal content, trying fallback"
+                );
+                // Fall through to try fallback selector
+                None
+            }
+            Err(ContentError::HttpStatus(422)) => {
+                tracing::debug!("Semantic selectors caused 422, trying fallback selector");
+                None
+            }
+            Err(e) => return Err(e),
+        };
 
     // Second attempt: fallback selector for generic layouts
     if content.is_none() {
