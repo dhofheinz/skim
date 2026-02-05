@@ -3,7 +3,7 @@
 //! This module contains the core event loop that multiplexes terminal input,
 //! background task events, and periodic ticks.
 
-use crate::app::{App, AppEvent};
+use crate::app::{App, AppEvent, ContentState, View};
 use anyhow::Result;
 use crossterm::{
     event::Event,
@@ -162,11 +162,20 @@ pub async fn run(
     Ok(())
 }
 
+/// Number of frames in the loading spinner animation.
+const SPINNER_FRAMES: usize = 10;
+
 /// Handle periodic tick for debounced search execution.
 ///
 /// PERF-015: Search is now spawned as an async background task to prevent
 /// UI blocking on large article sets. Results are sent via AppEvent::SearchCompleted.
 fn handle_tick(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) {
+    // Animate spinner when content is loading in reader view
+    if app.view == View::Reader && matches!(app.content_state, ContentState::Loading { .. }) {
+        app.spinner_frame = (app.spinner_frame + 1) % SPINNER_FRAMES;
+        app.needs_redraw = true;
+    }
+
     // PERF-006: Check for debounced search
     // Only execute debounced search if still in search mode
     if app.search_mode {

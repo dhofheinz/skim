@@ -18,8 +18,9 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // Update visible lines for scroll clamping (area height minus 2 for borders)
+    // Update viewport dimensions for scroll clamping (minus 2 for borders)
     app.reader_visible_lines = area.height.saturating_sub(2) as usize;
+    app.reader_viewport_width = area.width.saturating_sub(2) as usize;
 
     // BUG-012: Clamp scroll BEFORE rendering to prevent visual glitches on resize.
     // Previously, clamping happened after render in render.rs, which could cause
@@ -60,7 +61,15 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     // still clones elements due to Text's API, but avoids Vec::clone() overhead.
     let content_lines: Cow<'_, [Line<'static>]> = match &app.content_state {
         ContentState::Idle => Cow::Owned(vec![Line::from("Press Enter to load content...")]),
-        ContentState::Loading { .. } => Cow::Owned(vec![Line::from("Loading content...")]),
+        ContentState::Loading { .. } => {
+            const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let frame = app.spinner_frame % SPINNER.len();
+            Cow::Owned(vec![
+                Line::from(""),
+                Line::from(""),
+                Line::from(format!("{} Loading content...", SPINNER[frame])),
+            ])
+        }
         ContentState::Loaded { rendered_lines, .. } => Cow::Borrowed(rendered_lines),
         ContentState::Failed {
             error, fallback, ..

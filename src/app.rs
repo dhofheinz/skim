@@ -6,6 +6,7 @@ use reqwest::redirect::Policy;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::Instant;
+use unicode_width::UnicodeWidthStr;
 
 // ============================================================================
 // Cached Article State (PERF-008)
@@ -287,6 +288,17 @@ pub struct App {
     /// Updated during reader rendering to enable scroll clamping in input handlers.
     /// Does not include border lines (2 lines for top/bottom borders).
     pub reader_visible_lines: usize,
+
+    /// Last known reader viewport width (characters).
+    ///
+    /// Updated during reader rendering to enable accurate wrapped line count calculation.
+    /// Does not include border characters (2 chars for left/right borders).
+    pub reader_viewport_width: usize,
+
+    /// Current frame of the loading spinner animation (0-9).
+    ///
+    /// Incremented by the tick handler when content is loading.
+    pub spinner_frame: usize,
 }
 
 impl App {
@@ -334,6 +346,8 @@ impl App {
             search_generation: 0,
             search_handle: None,
             reader_visible_lines: 0,
+            reader_viewport_width: 0,
+            spinner_frame: 0,
         })
     }
 
@@ -579,22 +593,48 @@ impl App {
         self.scroll_offset = self.scroll_offset.min(max_scroll);
     }
 
-    /// Get the number of content lines in the reader view.
+    /// Get the number of display lines in the reader view (accounting for wrapping).
     ///
-    /// Returns the line count from rendered content if loaded, or a small
-    /// placeholder count for loading/error states. Includes the 3-line header.
+    /// Calculates wrapped line count based on viewport width. Each logical line
+    /// may wrap to multiple display lines depending on its width.
+    /// Includes the 3-line header.
     pub fn reader_content_lines(&self) -> usize {
         const HEADER_LINES: usize = 3; // Title, feed/time, blank line
+        let width = self.reader_viewport_width.max(1); // Avoid division by zero
+
         let content_lines = match &self.content_state {
             ContentState::Idle => 1,
             ContentState::Loading { .. } => 1,
-            ContentState::Loaded { rendered_lines, .. } => rendered_lines.len(),
+            ContentState::Loaded { rendered_lines, .. } => {
+                // Calculate wrapped line count for each line
+                rendered_lines
+                    .iter()
+                    .map(|line| Self::wrapped_line_count(line, width))
+                    .sum()
+            }
             ContentState::Failed { fallback, .. } => {
-                // Error line + blank + optional summary
-                2 + fallback.as_ref().map_or(0, |s| s.lines().count() + 2)
+                // Error line + blank + optional summary (estimate wrapping)
+                let base = 2;
+                let summary_lines = fallback.as_ref().map_or(0, |s| {
+                    2 + s
+                        .lines()
+                        .map(|l| l.width().max(1).div_ceil(width))
+                        .sum::<usize>()
+                });
+                base + summary_lines
             }
         };
         HEADER_LINES + content_lines
+    }
+
+    /// Calculate how many display lines a single Line will occupy after wrapping.
+    fn wrapped_line_count(line: &Line<'_>, viewport_width: usize) -> usize {
+        let line_width: usize = line.spans.iter().map(|s| s.content.width()).sum();
+        if line_width == 0 {
+            1 // Empty lines still take one line
+        } else {
+            line_width.div_ceil(viewport_width)
+        }
     }
 
     /// Clamp scroll offset to content bounds using stored viewport size.
@@ -974,6 +1014,7 @@ mod tests {
         let mut app = test_app().await;
         app.scroll_offset = 100;
         app.reader_visible_lines = 20;
+        app.reader_viewport_width = 80; // Wide enough that "test" doesn't wrap
 
         // Set up loaded content with 30 lines
         let rendered_lines: Vec<Line<'static>> = (0..30).map(|_| Line::from("test")).collect();
@@ -1002,6 +1043,7 @@ mod tests {
         use ratatui::text::Line;
 
         let mut app = test_app().await;
+        app.reader_viewport_width = 80; // Wide enough that "test" doesn't wrap
         let rendered_lines: Vec<Line<'static>> = (0..50).map(|_| Line::from("test")).collect();
         app.content_state = ContentState::Loaded {
             article_id: 1,
