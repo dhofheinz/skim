@@ -4,7 +4,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem},
+    widgets::{Block, Borders, List, ListItem, ListState},
     Frame,
 };
 
@@ -85,12 +85,16 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let title = format!("Feeds ({})", app.feeds.len());
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(border_style)
-            .title(title),
-    );
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title(title),
+        )
+        .highlight_style(Style::default()); // Selection styling handled per-item above
 
-    f.render_widget(list, area);
+    // Use ListState to enable auto-scrolling to keep selection visible
+    let mut state = ListState::default().with_selected(Some(app.selected_feed));
+    f.render_stateful_widget(list, area, &mut state);
 }
