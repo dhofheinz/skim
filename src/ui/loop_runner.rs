@@ -14,8 +14,10 @@ use futures::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::{self, Stdout};
 use std::time::Duration;
-use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
+
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
 
 use super::events::handle_app_event;
 use super::input::handle_input;
@@ -76,8 +78,11 @@ pub async fn run(
     // PERF-012: Use interval instead of sleep for consistent periodic ticks
     let mut tick_interval = tokio::time::interval(Duration::from_millis(250));
 
-    // Signal handlers for graceful shutdown
+    // Signal handlers for graceful shutdown (Unix only)
+    // On non-Unix platforms, these become pending futures that never complete
+    #[cfg(unix)]
     let mut sigterm = signal(SignalKind::terminate())?;
+    #[cfg(unix)]
     let mut sigint = signal(SignalKind::interrupt())?;
 
     loop {
@@ -101,16 +106,27 @@ pub async fn run(
             handle_app_event(app, event).await;
         }
 
+        // Platform-specific signal futures
+        #[cfg(unix)]
+        let sigterm_fut = sigterm.recv();
+        #[cfg(not(unix))]
+        let sigterm_fut = std::future::pending::<Option<()>>();
+
+        #[cfg(unix)]
+        let sigint_fut = sigint.recv();
+        #[cfg(not(unix))]
+        let sigint_fut = std::future::pending::<Option<()>>();
+
         tokio::select! {
             biased;  // Process in order listed for predictable behavior
 
             // Signal handlers for graceful shutdown (highest priority)
-            _ = sigterm.recv() => {
+            _ = sigterm_fut => {
                 tracing::info!("Received SIGTERM, shutting down gracefully");
                 break;
             }
 
-            _ = sigint.recv() => {
+            _ = sigint_fut => {
                 tracing::info!("Received SIGINT, shutting down gracefully");
                 break;
             }
