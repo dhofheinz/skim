@@ -352,7 +352,9 @@ fn handle_content_loaded(
         }
     } else {
         // Not in reader view - discard content silently
+        // Must still clear loading flag to prevent blocking future loads
         tracing::debug!(article_id, "Discarding content - not in reader view");
+        app.content_loading_for = None;
     }
 }
 
