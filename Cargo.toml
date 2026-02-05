@@ -12,7 +12,7 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 
 # HTTP
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 
 # Database (async SQLite)
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
@@ -44,3 +44,12 @@ sha2 = "0.10"
 open = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+unicode-width = "0.2"
+
+[dev-dependencies]
+# Testing utilities
+wiremock = "0.6"          # HTTP mocking
+pretty_assertions = "1"   # Better test output
+proptest = "1"            # Property-based testing
+tokio = { version = "1", features = ["test-util", "rt", "macros"] }  # Time control for tests
