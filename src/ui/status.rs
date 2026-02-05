@@ -5,27 +5,36 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+use std::borrow::Cow;
 
 /// Render the status bar
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let text = if let Some((done, total)) = app.refresh_progress {
-        // Show refresh progress
-        format!("Refreshing... {}/{} feeds", done, total)
+    // EDGE-001: Guard against zero-width/height areas
+    // Status bar needs at least 1 char width to be meaningful
+    if area.width < 1 || area.height < 1 {
+        return;
+    }
+
+    // Use Cow to avoid allocations for static strings and borrowed status messages
+    let text: Cow<'_, str> = if let Some((done, total)) = app.refresh_progress {
+        // Dynamic content requires allocation
+        Cow::Owned(format!("Refreshing... {}/{} feeds", done, total))
     } else if let Some((msg, _)) = &app.status_message {
-        // Show status message
-        msg.clone()
+        // Borrow existing status message instead of cloning
+        Cow::Borrowed(msg.as_str())
     } else {
-        // Show keybindings for current view
+        // Static keybinding hints - zero allocation
         match app.view {
             View::Browse => {
                 if app.search_mode {
-                    "Type to search | ESC cancel | ENTER confirm".to_string()
+                    Cow::Borrowed("Type to search | ESC cancel | ENTER confirm")
                 } else {
-                    "[r]efresh all [R]efresh one [/]search [s]tar [o]pen [Tab]switch [q]uit"
-                        .to_string()
+                    Cow::Borrowed(
+                        "[r]efresh all [R]efresh one [/]search [s]tar [o]pen [Tab]switch [q]uit",
+                    )
                 }
             }
-            View::Reader => "[b]ack [j/k]scroll [Ctrl+d/u]page [s]tar [o]pen [q]uit".to_string(),
+            View::Reader => Cow::Borrowed("[b]ack [j/k]scroll [Ctrl+d/u]page [s]tar [o]pen [q]uit"),
         }
     };
 
