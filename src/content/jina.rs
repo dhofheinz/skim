@@ -32,9 +32,13 @@ fn monotonic_ms() -> u64 {
 }
 
 /// CSS selectors targeting main article content across common blog platforms.
-/// Order matters: more specific selectors first, generic fallbacks last.
+/// These are semantic content selectors used as the first attempt.
 const TARGET_SELECTORS: &str =
     "article, .entry-content, .post-content, .article-content, .post-body, main .content, main";
+
+/// Fallback selector for sites using generic layout classes.
+/// Tried after semantic selectors fail (422), before giving up on selectors entirely.
+const FALLBACK_SELECTOR: &str = ".container";
 
 /// Minimum content length (in bytes) to consider a fetch successful.
 /// If X-Target-Selector returns less than this, we retry without it.
@@ -157,20 +161,52 @@ pub async fn fetch_content(
 
     let jina_url = format!("{}/{}", base, parsed_url.as_str());
 
-    // First attempt: with X-Target-Selector for cleaner extraction
-    let content = fetch_with_retry(client, &jina_url, true).await?;
+    // Priority chain for selector strategies:
+    // 1. Semantic selectors (article, .entry-content, etc.)
+    // 2. Fallback selector (.container) for generic layouts
+    // 3. No selector (let jina.ai extract full page)
 
-    // If selector returned too little content, retry without it
-    // (some sites don't use standard article/main containers)
-    if content.len() < MIN_CONTENT_LEN {
-        tracing::debug!(
-            content_len = content.len(),
-            "Target selector returned minimal content, retrying without selector"
-        );
-        let content = fetch_with_retry(client, &jina_url, false).await?;
-        return Ok(strip_boilerplate(&content));
+    // First attempt: semantic content selectors
+    let content: Option<()> = match fetch_with_retry(client, &jina_url, Some(TARGET_SELECTORS)).await {
+        Ok(content) if content.len() >= MIN_CONTENT_LEN => {
+            return Ok(strip_boilerplate(&content));
+        }
+        Ok(content) => {
+            tracing::debug!(
+                content_len = content.len(),
+                "Semantic selectors returned minimal content, trying fallback"
+            );
+            // Fall through to try fallback selector
+            None
+        }
+        Err(ContentError::HttpStatus(422)) => {
+            tracing::debug!("Semantic selectors caused 422, trying fallback selector");
+            None
+        }
+        Err(e) => return Err(e),
+    };
+
+    // Second attempt: fallback selector for generic layouts
+    if content.is_none() {
+        match fetch_with_retry(client, &jina_url, Some(FALLBACK_SELECTOR)).await {
+            Ok(content) if content.len() >= MIN_CONTENT_LEN => {
+                return Ok(strip_boilerplate(&content));
+            }
+            Ok(content) => {
+                tracing::debug!(
+                    content_len = content.len(),
+                    "Fallback selector returned minimal content, trying no selector"
+                );
+            }
+            Err(ContentError::HttpStatus(422)) => {
+                tracing::debug!("Fallback selector caused 422, trying no selector");
+            }
+            Err(e) => return Err(e),
+        }
     }
 
+    // Final attempt: no selector, let jina.ai do full page extraction
+    let content = fetch_with_retry(client, &jina_url, None).await?;
     Ok(strip_boilerplate(&content))
 }
 
@@ -179,13 +215,13 @@ pub async fn fetch_content(
 async fn fetch_with_retry(
     client: &reqwest::Client,
     jina_url: &str,
-    use_selector: bool,
+    selector: Option<&str>,
 ) -> Result<String, ContentError> {
     const MAX_RETRIES: u32 = 3;
     let mut retry_count = 0;
 
     loop {
-        match fetch_with_selector(client, jina_url, use_selector).await {
+        match fetch_with_selector(client, jina_url, selector).await {
             Ok(content) => return Ok(content),
             Err(e) if e.is_retryable() && retry_count < MAX_RETRIES => {
                 let delay = 1u64 << retry_count; // 1s, 2s, 4s
@@ -207,12 +243,12 @@ async fn fetch_with_retry(
 async fn fetch_with_selector(
     client: &reqwest::Client,
     jina_url: &str,
-    use_selector: bool,
+    selector: Option<&str>,
 ) -> Result<String, ContentError> {
     let mut request = client.get(jina_url);
 
-    if use_selector {
-        request = request.header("X-Target-Selector", TARGET_SELECTORS);
+    if let Some(sel) = selector {
+        request = request.header("X-Target-Selector", sel);
     }
 
     // SEC-002: Only send API key to official Jina domain to prevent credential leakage
