@@ -82,7 +82,7 @@ skim
 
 ## Configuration
 
-Config directory: `~/.config/rss-reader/`
+Config directory: `~/.config/skim/`
 
 | File | Purpose |
 |------|---------|

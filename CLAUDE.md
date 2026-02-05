@@ -19,7 +19,7 @@ skim --import /path/to/feeds.opml  # Import OPML file
 skim --reset-db                    # Reset database
 ```
 
-Config stored at `~/.config/rss-reader/` (feeds.opml, rss.db).
+Config stored at `~/.config/skim/` (feeds.opml, rss.db).
 
 ## Architecture
 
