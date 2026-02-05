@@ -269,7 +269,7 @@ mod tests {
         // or our code generates a SHA256 hash (63-64 hex chars) as fallback.
         // Either way, we get a non-empty, deterministic identifier.
         let len = result.articles[0].guid.len();
-        assert!(len >= 31 && len <= 64, "unexpected GUID length: {}", len);
+        assert!((31..=64).contains(&len), "unexpected GUID length: {}", len);
     }
 
     #[test]
