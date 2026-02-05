@@ -1393,7 +1393,7 @@ impl Database {
         for id in feed_ids {
             separated.push_bind(*id);
         }
-        separated.push_unseparated(") ORDER BY fetched_at DESC LIMIT ");
+        separated.push_unseparated(") ORDER BY published DESC LIMIT ");
         builder.push_bind(safe_limit);
 
         let rows: Vec<ArticleRow> = builder.build_query_as().fetch_all(&self.pool).await?;

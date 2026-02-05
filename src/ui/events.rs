@@ -5,6 +5,7 @@
 
 use crate::app::{App, AppEvent, ContentState, Focus, View};
 use crate::storage::Article;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +13,49 @@ use super::reader::render_markdown;
 
 /// Maximum number of articles in What's New list to prevent memory exhaustion
 pub(super) const MAX_WHATS_NEW: usize = 100;
+
+/// Round-robin distribute articles across feeds for variety.
+///
+/// Takes a list of (feed_id, article) tuples and interleaves them so no single
+/// feed dominates the list. Articles within each feed maintain their order
+/// (by published date from the query).
+fn round_robin_by_feed(
+    articles: Vec<(i64, Article)>,
+    feed_title_cache: &HashMap<i64, Arc<str>>,
+) -> Vec<(Arc<str>, Article)> {
+    // Group articles by feed, preserving order within each feed
+    let mut by_feed: HashMap<i64, Vec<Article>> = HashMap::new();
+    for (feed_id, article) in articles {
+        by_feed.entry(feed_id).or_default().push(article);
+    }
+
+    // Convert to vec of (feed_id, articles) for round-robin iteration
+    let mut feeds: Vec<(i64, std::collections::VecDeque<Article>)> = by_feed
+        .into_iter()
+        .map(|(id, arts)| (id, arts.into_iter().collect()))
+        .collect();
+
+    // Round-robin pick from each feed
+    let mut result = Vec::with_capacity(MAX_WHATS_NEW);
+    while result.len() < MAX_WHATS_NEW && !feeds.is_empty() {
+        // Take one article from each feed that still has articles
+        feeds.retain_mut(|(feed_id, articles)| {
+            if result.len() >= MAX_WHATS_NEW {
+                return false; // Stop early if we hit the limit
+            }
+            if let Some(article) = articles.pop_front() {
+                let title = feed_title_cache
+                    .get(feed_id)
+                    .map(Arc::clone)
+                    .unwrap_or_else(|| Arc::from("Unknown"));
+                result.push((title, article));
+            }
+            !articles.is_empty() // Retain only feeds with remaining articles
+        });
+    }
+
+    result
+}
 
 /// Handle application events from background tasks.
 ///
@@ -236,20 +280,15 @@ async fn handle_refresh_complete(app: &mut App, results: Vec<crate::app::FetchRe
 
             if !feed_ids.is_empty() {
                 // PERF-001: Single batched query instead of N queries
-                if let Ok(recent) = app.db.get_recent_articles_for_feeds(&feed_ids, 20).await {
-                    // PERF-005: Use cached feed title map instead of rebuilding
-                    // PERF-009: Arc::clone for cheap reference counting
-                    let new_articles: Vec<(Arc<str>, Article)> = recent
-                        .into_iter()
-                        .map(|(feed_id, article)| {
-                            let title = app
-                                .feed_title_cache
-                                .get(&feed_id)
-                                .map(Arc::clone)
-                                .unwrap_or_else(|| Arc::from("Unknown"));
-                            (title, article)
-                        })
-                        .collect();
+                // Fetch larger pool for round-robin distribution across feeds
+                let pool_size = (feed_ids.len() * 10).max(100);
+                if let Ok(recent) = app
+                    .db
+                    .get_recent_articles_for_feeds(&feed_ids, pool_size)
+                    .await
+                {
+                    // Round-robin across feeds for variety in What's New
+                    let new_articles = round_robin_by_feed(recent, &app.feed_title_cache);
 
                     if !new_articles.is_empty() {
                         // MEM-001: Bound whats_new list to prevent memory exhaustion
