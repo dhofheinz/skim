@@ -60,6 +60,10 @@ const ELLIPSIS_WIDTH: usize = 3;
 ///
 /// # Edge Case Behavior
 ///
+/// B-7: Zero-width characters (combining marks, ZWJ) have display width 0, so they
+/// are always preserved without truncation. Strings consisting entirely of zero-width
+/// characters will always pass the "fits within width" check and return borrowed.
+///
 /// For very narrow widths (0-3 columns), we return characters that fit without
 /// ellipsis, since there's not enough room for "char + ellipsis":
 /// - width 0: "" (empty)
@@ -143,6 +147,96 @@ pub fn truncate_to_width(s: &str, max_width: usize) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(s) // No allocation needed - string fits!
     }
+}
+
+/// SEC-001: Strip terminal control characters and ANSI escape sequences from text.
+///
+/// Removes characters that could manipulate terminal behavior when rendering
+/// user-controlled text (feed titles, article content, etc.) from RSS feeds.
+///
+/// Strips:
+/// - ASCII control chars: 0x00-0x08, 0x0B-0x0C, 0x0E-0x1F, 0x7F
+/// - ANSI CSI sequences: `\x1b[` ... (terminal byte 0x40-0x7E)
+/// - ANSI OSC sequences: `\x1b]` ... (until BEL 0x07 or ST `\x1b\\`)
+/// - Bare ESC (0x1b) not followed by `[` or `]`
+///
+/// Preserves: tab (0x09), newline (0x0A), carriage return (0x0D).
+///
+/// Returns `Cow::Borrowed` when the input contains no control characters (common case).
+///
+/// P-9: The fast path (byte scan via `Iterator::any`) makes repeated calls on already-clean
+/// content essentially free — a single pass over bytes with no allocation or string building.
+pub fn strip_control_chars(s: &str) -> Cow<'_, str> {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+
+    // Fast path: scan for any byte that needs stripping
+    let needs_strip = bytes
+        .iter()
+        .any(|&b| b == 0x1b || b == 0x7f || (b < 0x20 && b != 0x09 && b != 0x0a && b != 0x0d));
+
+    if !needs_strip {
+        return Cow::Borrowed(s);
+    }
+
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+
+        if b == 0x1b {
+            // ESC byte — check what follows
+            if i + 1 < len && bytes[i + 1] == b'[' {
+                // CSI sequence: skip \x1b[ then parameter/intermediate bytes until final byte
+                i += 2;
+                while i < len {
+                    let c = bytes[i];
+                    i += 1;
+                    if (0x40..=0x7e).contains(&c) {
+                        break; // final byte consumed
+                    }
+                }
+            } else if i + 1 < len && bytes[i + 1] == b']' {
+                // OSC sequence: skip \x1b] then everything until BEL or ST (\x1b\\)
+                i += 2;
+                while i < len {
+                    if bytes[i] == 0x07 {
+                        i += 1; // consume BEL
+                        break;
+                    }
+                    if bytes[i] == 0x1b && i + 1 < len && bytes[i + 1] == b'\\' {
+                        i += 2; // consume ST
+                        break;
+                    }
+                    i += 1;
+                }
+            } else {
+                // Bare ESC — skip it
+                i += 1;
+            }
+        } else if b == 0x7f || (b < 0x20 && b != 0x09 && b != 0x0a && b != 0x0d) {
+            // Control character (not tab/newline/CR) — skip
+            i += 1;
+        } else {
+            // Safe byte — find the run of safe bytes to batch-copy
+            let start = i;
+            i += 1;
+            while i < len {
+                let nb = bytes[i];
+                if nb == 0x1b || nb == 0x7f || (nb < 0x20 && nb != 0x09 && nb != 0x0a && nb != 0x0d)
+                {
+                    break;
+                }
+                i += 1;
+            }
+            // SAFETY: we only break on ASCII control bytes, which cannot appear
+            // mid-codepoint in valid UTF-8, so s[start..i] is valid UTF-8.
+            out.push_str(&s[start..i]);
+        }
+    }
+
+    Cow::Owned(out)
 }
 
 #[cfg(test)]
@@ -230,5 +324,102 @@ mod tests {
         let mixed = "Hello世界";
         let result = truncate_to_width(mixed, 8);
         assert!(!result.is_empty());
+    }
+
+    // ========================================================================
+    // strip_control_chars tests
+    // ========================================================================
+
+    #[test]
+    fn test_strip_clean_text_returns_borrowed() {
+        let input = "Hello, world! This is clean text.";
+        let result = strip_control_chars(input);
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_strip_preserves_tabs_newlines_cr() {
+        let input = "line1\nline2\ttabbed\r\nwindows";
+        let result = strip_control_chars(input);
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_strip_control_chars_removes_controls() {
+        // NUL, BEL, BS, VT, FF, and other C0 controls
+        let input = "he\x00ll\x07o\x08 w\x0bor\x0cld\x01!";
+        let result = strip_control_chars(input);
+        assert!(matches!(result, Cow::Owned(_)));
+        assert_eq!(result, "hello world!");
+    }
+
+    #[test]
+    fn test_strip_removes_del() {
+        let input = "delete\x7fme";
+        let result = strip_control_chars(input);
+        assert_eq!(result, "deleteme");
+    }
+
+    #[test]
+    fn test_strip_ansi_color_codes() {
+        // CSI SGR: \x1b[31m (red) and \x1b[0m (reset)
+        let input = "\x1b[31mRed text\x1b[0m";
+        let result = strip_control_chars(input);
+        assert_eq!(result, "Red text");
+    }
+
+    #[test]
+    fn test_strip_ansi_cursor_movement() {
+        // CSI cursor up: \x1b[2A
+        let input = "before\x1b[2Aafter";
+        let result = strip_control_chars(input);
+        assert_eq!(result, "beforeafter");
+    }
+
+    #[test]
+    fn test_strip_osc_with_bel() {
+        // OSC set window title: \x1b]0;title\x07
+        let input = "\x1b]0;malicious title\x07safe text";
+        let result = strip_control_chars(input);
+        assert_eq!(result, "safe text");
+    }
+
+    #[test]
+    fn test_strip_osc_with_st() {
+        // OSC with ST terminator: \x1b]0;title\x1b\\
+        let input = "\x1b]0;malicious title\x1b\\safe text";
+        let result = strip_control_chars(input);
+        assert_eq!(result, "safe text");
+    }
+
+    #[test]
+    fn test_strip_bare_esc() {
+        let input = "before\x1bafter";
+        let result = strip_control_chars(input);
+        assert_eq!(result, "beforeafter");
+    }
+
+    #[test]
+    fn test_strip_mixed_content() {
+        // Mix of ANSI, OSC, control chars, and normal text
+        let input = "\x1b[31mRed\x1b[0m \x00NUL \x1b]0;title\x07 \x08BS normal";
+        let result = strip_control_chars(input);
+        assert_eq!(result, "Red NUL  BS normal");
+    }
+
+    #[test]
+    fn test_strip_empty_string() {
+        let result = strip_control_chars("");
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_strip_unicode_preserved() {
+        let input = "日本語 \x1b[31m赤い\x1b[0m テキスト";
+        let result = strip_control_chars(input);
+        assert_eq!(result, "日本語 赤い テキスト");
     }
 }

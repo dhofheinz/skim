@@ -95,6 +95,77 @@ pub fn validate_url(url_str: &str) -> Result<Url, UrlValidationError> {
     Ok(url)
 }
 
+/// Validates a URL before passing to `open::that()` to prevent command injection.
+///
+/// Performs SSRF checks via [`validate_url`] first, then applies shell-safety checks
+/// against control characters, encoded newlines, and dangerous shell metacharacters.
+///
+/// # Security
+///
+/// This function guards against:
+/// - All SSRF vectors (via `validate_url`: private IPs, localhost, non-HTTP schemes)
+/// - Control characters (ASCII 0-31, DEL) that could manipulate shell behavior
+/// - Unicode line/paragraph separators (U+2028, U+2029) that could act as newlines
+/// - Dangerous shell metacharacters (backtick, $, ;, |, <, >, backslash, etc.) that could enable command injection
+/// - Percent-encoded CR/LF (`%0A`, `%0D`) to prevent newline injection
+///
+/// Note: Valid URL characters like `&`, `?`, `=`, `#` are allowed since they're common in query strings.
+///
+/// # Returns
+///
+/// - `Ok(())` if the URL is safe to open
+/// - `Err(&'static str)` with a user-friendly error message otherwise
+pub fn validate_url_for_open(url_str: &str) -> Result<(), &'static str> {
+    // Check for control characters (ASCII 0-31 and DEL 127)
+    if url_str.bytes().any(|b| b < 32 || b == 127) {
+        return Err("URL contains invalid control characters");
+    }
+
+    // Block Unicode line/paragraph separators that could act as newlines in shell contexts
+    if url_str.chars().any(|c| c == '\u{2028}' || c == '\u{2029}') {
+        return Err("URL contains Unicode line separator characters");
+    }
+
+    // SEC-003: Block percent-encoded CR/LF (%0A, %0D) to prevent command injection.
+    // On Linux, open::that() uses xdg-open which shells through /bin/sh.
+    // If encoded newlines are decoded before shell execution, they could inject commands.
+    if url_str.contains("%0A")
+        || url_str.contains("%0a")
+        || url_str.contains("%0D")
+        || url_str.contains("%0d")
+    {
+        return Err("URL contains encoded control characters");
+    }
+
+    // Ensure URL uses http or https scheme (checked before validate_url to preserve
+    // the specific error message for non-http schemes)
+    if !url_str.starts_with("http://") && !url_str.starts_with("https://") {
+        return Err("URL must use http or https scheme");
+    }
+
+    // Reject particularly dangerous shell metacharacters
+    // Note: & is valid in query strings, so we only block the most dangerous ones
+    const DANGEROUS_CHARS: &[char] = &['`', '$', ';', '|', '<', '>', '(', ')', '{', '}', '\\'];
+    if url_str.chars().any(|c| DANGEROUS_CHARS.contains(&c)) {
+        return Err("URL contains potentially unsafe characters");
+    }
+
+    // SSRF checks via validate_url(): localhost, private IPs, plus URL format validation.
+    // Scheme is already verified above, so remaining errors are parse failures or SSRF blocks.
+    validate_url(url_str).map_err(|e| match e {
+        UrlValidationError::InvalidUrl(_) => "Invalid URL format",
+        UrlValidationError::Localhost | UrlValidationError::PrivateIp(_) => {
+            "URL points to a restricted address"
+        }
+        UrlValidationError::UnsupportedScheme(_) => {
+            // Should not reach here since scheme is checked above
+            "URL must use http or https scheme"
+        }
+    })?;
+
+    Ok(())
+}
+
 fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => {
@@ -103,6 +174,11 @@ fn is_private_ip(ip: &IpAddr) -> bool {
         IpAddr::V6(ipv6) => {
             if ipv6.is_loopback() || ipv6.is_unspecified() {
                 return true;
+            }
+            // SEC-003: Check IPv4-mapped IPv6 addresses (e.g. ::ffff:127.0.0.1)
+            // to prevent SSRF bypass via IPv4-mapped notation
+            if let Some(mapped_v4) = ipv6.to_ipv4_mapped() {
+                return is_private_ip(&IpAddr::V4(mapped_v4));
             }
             let segments = ipv6.segments();
             // Unique Local (fc00::/7)
@@ -186,5 +262,188 @@ mod tests {
     fn test_valid_url_with_port_accepted() {
         let result = validate_url("https://example.com:443/feed.xml");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_ipv4_mapped_ipv6_loopback_rejected() {
+        let result = validate_url("http://[::ffff:127.0.0.1]/feed");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ipv4_mapped_ipv6_private_rejected() {
+        assert!(validate_url("http://[::ffff:192.168.1.1]/feed").is_err());
+        assert!(validate_url("http://[::ffff:10.0.0.1]/feed").is_err());
+    }
+
+    // --- validate_url_for_open tests ---
+
+    // Valid URLs
+
+    #[test]
+    fn test_validate_url_for_open_valid_https() {
+        assert!(validate_url_for_open("https://example.com/article").is_ok());
+    }
+
+    #[test]
+    fn test_validate_url_for_open_valid_http() {
+        assert!(validate_url_for_open("http://example.com/page").is_ok());
+    }
+
+    #[test]
+    fn test_validate_url_for_open_valid_with_query_params() {
+        assert!(validate_url_for_open("https://example.com/search?q=rust&page=1").is_ok());
+    }
+
+    #[test]
+    fn test_validate_url_for_open_valid_with_fragment() {
+        assert!(validate_url_for_open("https://example.com/article#section-2").is_ok());
+    }
+
+    #[test]
+    fn test_validate_url_for_open_valid_with_path() {
+        assert!(validate_url_for_open("https://example.com/a/b/c/d.html").is_ok());
+    }
+
+    // Control character rejection
+
+    #[test]
+    fn test_validate_url_for_open_rejects_null_byte() {
+        let result = validate_url_for_open("https://example.com/\x00bad");
+        assert_eq!(result, Err("URL contains invalid control characters"));
+    }
+
+    #[test]
+    fn test_validate_url_for_open_rejects_raw_newline() {
+        let result = validate_url_for_open("https://example.com/\nbad");
+        assert_eq!(result, Err("URL contains invalid control characters"));
+    }
+
+    #[test]
+    fn test_validate_url_for_open_rejects_raw_carriage_return() {
+        let result = validate_url_for_open("https://example.com/\rbad");
+        assert_eq!(result, Err("URL contains invalid control characters"));
+    }
+
+    #[test]
+    fn test_validate_url_for_open_rejects_del() {
+        let result = validate_url_for_open("https://example.com/\x7Fbad");
+        assert_eq!(result, Err("URL contains invalid control characters"));
+    }
+
+    // Encoded newline rejection (SEC-003)
+
+    #[test]
+    fn test_validate_url_for_open_rejects_encoded_lf_uppercase() {
+        let result = validate_url_for_open("https://example.com/%0Aevil");
+        assert_eq!(result, Err("URL contains encoded control characters"));
+    }
+
+    #[test]
+    fn test_validate_url_for_open_rejects_encoded_lf_lowercase() {
+        let result = validate_url_for_open("https://example.com/%0aevil");
+        assert_eq!(result, Err("URL contains encoded control characters"));
+    }
+
+    #[test]
+    fn test_validate_url_for_open_rejects_encoded_cr_uppercase() {
+        let result = validate_url_for_open("https://example.com/%0Devil");
+        assert_eq!(result, Err("URL contains encoded control characters"));
+    }
+
+    #[test]
+    fn test_validate_url_for_open_rejects_encoded_cr_lowercase() {
+        let result = validate_url_for_open("https://example.com/%0devil");
+        assert_eq!(result, Err("URL contains encoded control characters"));
+    }
+
+    #[test]
+    fn test_validate_url_for_open_rejects_encoded_crlf() {
+        let result = validate_url_for_open("https://example.com/%0D%0Aevil");
+        assert_eq!(result, Err("URL contains encoded control characters"));
+    }
+
+    // Scheme rejection
+
+    #[test]
+    fn test_validate_url_for_open_rejects_javascript_scheme() {
+        let result = validate_url_for_open("javascript:alert(1)");
+        assert_eq!(result, Err("URL must use http or https scheme"));
+    }
+
+    #[test]
+    fn test_validate_url_for_open_rejects_file_scheme() {
+        let result = validate_url_for_open("file:///etc/passwd");
+        assert_eq!(result, Err("URL must use http or https scheme"));
+    }
+
+    #[test]
+    fn test_validate_url_for_open_rejects_data_scheme() {
+        let result = validate_url_for_open("data:text/html,<h1>Hi</h1>");
+        assert_eq!(result, Err("URL must use http or https scheme"));
+    }
+
+    // Dangerous character rejection
+
+    #[test]
+    fn test_validate_url_for_open_rejects_backtick() {
+        let result = validate_url_for_open("https://example.com/`whoami`");
+        assert_eq!(result, Err("URL contains potentially unsafe characters"));
+    }
+
+    #[test]
+    fn test_validate_url_for_open_rejects_dollar() {
+        let result = validate_url_for_open("https://example.com/$HOME");
+        assert_eq!(result, Err("URL contains potentially unsafe characters"));
+    }
+
+    #[test]
+    fn test_validate_url_for_open_rejects_semicolon() {
+        let result = validate_url_for_open("https://example.com/;rm -rf /");
+        assert_eq!(result, Err("URL contains potentially unsafe characters"));
+    }
+
+    #[test]
+    fn test_validate_url_for_open_rejects_pipe() {
+        let result = validate_url_for_open("https://example.com/|cat /etc/passwd");
+        assert_eq!(result, Err("URL contains potentially unsafe characters"));
+    }
+
+    // Invalid URL format
+
+    #[test]
+    fn test_validate_url_for_open_rejects_malformed() {
+        let result = validate_url_for_open("https://");
+        assert_eq!(result, Err("Invalid URL format"));
+    }
+
+    // Unicode separator rejection
+
+    #[test]
+    fn test_validate_url_for_open_rejects_unicode_line_separator() {
+        let url = "https://example.com/\u{2028}evil".to_string();
+        let result = validate_url_for_open(&url);
+        assert_eq!(
+            result,
+            Err("URL contains Unicode line separator characters")
+        );
+    }
+
+    #[test]
+    fn test_validate_url_for_open_rejects_unicode_paragraph_separator() {
+        let url = "https://example.com/\u{2029}evil".to_string();
+        let result = validate_url_for_open(&url);
+        assert_eq!(
+            result,
+            Err("URL contains Unicode line separator characters")
+        );
+    }
+
+    // Backslash rejection
+
+    #[test]
+    fn test_validate_url_for_open_rejects_backslash() {
+        let result = validate_url_for_open("https://example.com/\\evil");
+        assert_eq!(result, Err("URL contains potentially unsafe characters"));
     }
 }

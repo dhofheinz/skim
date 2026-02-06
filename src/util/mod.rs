@@ -23,5 +23,8 @@
 mod text;
 mod url_validator;
 
-pub use text::{display_width, truncate_to_width};
-pub use url_validator::validate_url;
+pub use text::{display_width, strip_control_chars, truncate_to_width};
+pub use url_validator::{validate_url, validate_url_for_open};
+
+/// Maximum allowed search query length — shared across UI validation and FTS5 validation layers
+pub const MAX_SEARCH_QUERY_LENGTH: usize = 256;
