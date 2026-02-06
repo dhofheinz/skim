@@ -22,9 +22,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use super::events::handle_app_event;
 use super::input::handle_input;
 use super::render::render;
-
-/// Maximum allowed search query length (UI layer validation)
-const MAX_SEARCH_LENGTH: usize = 256;
+use crate::util::MAX_SEARCH_QUERY_LENGTH;
 
 /// Result of handling a key press event.
 ///
@@ -67,8 +65,11 @@ pub async fn run(
     // Install panic hook BEFORE setting up terminal
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        // B-8: Prevent double-panic if terminal restore fails
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        }));
         original_hook(panic_info);
     }));
 
@@ -158,6 +159,19 @@ pub async fn run(
         }
     }
 
+    // Save session snapshot on exit
+    let snapshot = app.snapshot();
+    match serde_json::to_string(&snapshot) {
+        Ok(json) => {
+            if let Err(e) = app.db.set_preference("session.snapshot", &json).await {
+                tracing::warn!(error = %e, "Failed to save session snapshot");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to serialize session snapshot");
+        }
+    }
+
     restore_terminal(terminal)?;
     Ok(())
 }
@@ -188,10 +202,10 @@ fn handle_tick(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) {
                         if let Some(feed) = app.selected_feed() {
                             spawn_empty_query_restore(app, feed.id, event_tx);
                         }
-                    } else if query.len() > MAX_SEARCH_LENGTH {
+                    } else if query.len() > MAX_SEARCH_QUERY_LENGTH {
                         app.set_status(format!(
                             "Search query too long (max {} chars)",
-                            MAX_SEARCH_LENGTH
+                            MAX_SEARCH_QUERY_LENGTH
                         ));
                     } else {
                         // PERF-015: Spawn search as background task
@@ -247,6 +261,17 @@ fn spawn_search(app: &mut App, query: String, event_tx: &mpsc::Sender<AppEvent>)
 ///
 /// PERF-015: Like search, empty query restoration is also async to prevent UI blocking.
 fn spawn_empty_query_restore(app: &mut App, feed_id: i64, event_tx: &mpsc::Sender<AppEvent>) {
+    // B-4: Check cached articles before querying DB
+    if let Some(ref cached) = app.cached_articles {
+        if cached.feed_id == Some(feed_id) {
+            app.articles = std::sync::Arc::clone(&cached.articles);
+            app.selected_article = cached.selected;
+            app.clamp_selections();
+            app.needs_redraw = true;
+            return;
+        }
+    }
+
     // Abort any previous search task
     if let Some(handle) = app.search_handle.take() {
         handle.abort();
