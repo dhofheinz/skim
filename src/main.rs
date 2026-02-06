@@ -1,14 +1,18 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Parser;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 mod app;
+mod config;
 mod content;
 mod feed;
+mod keybindings;
+mod preferences;
 mod storage;
+mod theme;
 mod ui;
 mod util;
 
@@ -20,6 +24,14 @@ fn get_config_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME environment variable not set")?;
     let config_dir = PathBuf::from(home).join(".config").join("skim");
     Ok(config_dir)
+}
+
+/// S-5: Return the last 2 path components to avoid leaking full directory
+/// structure in user-facing error messages.
+fn truncate_path(path: &Path) -> String {
+    let components: Vec<_> = path.components().rev().take(2).collect();
+    let short: PathBuf = components.into_iter().rev().collect();
+    short.display().to_string()
 }
 
 /// Atomically copy a file using write-to-temp-then-rename pattern.
@@ -37,9 +49,10 @@ fn atomic_copy(src: &Path, dst: &Path) -> Result<()> {
 
     // Read source content
     let content = std::fs::read(src).with_context(|| {
+        tracing::debug!(path = %src.display(), "Failed to read source file");
         format!(
             "Failed to read source file '{}': check file permissions",
-            src.display()
+            truncate_path(src)
         )
     })?;
 
@@ -48,27 +61,34 @@ fn atomic_copy(src: &Path, dst: &Path) -> Result<()> {
         .create_new(true) // Fails atomically if file exists (prevents symlink race)
         .open(&temp_path)
         .with_context(|| {
+            tracing::debug!(path = %temp_path.display(), "Failed to create temporary file");
             format!(
                 "Failed to create temporary file '{}': check directory permissions or disk space",
-                temp_path.display()
+                truncate_path(&temp_path)
             )
         })?;
 
     temp_file.write_all(&content).with_context(|| {
-        // Clean up temp file on write failure
-        let _ = std::fs::remove_file(&temp_path);
+        // B-5: Warn on temp file cleanup failure instead of silently ignoring
+        if let Err(e) = std::fs::remove_file(&temp_path) {
+            tracing::warn!(path = %temp_path.display(), error = %e, "Failed to clean up temp file");
+        }
+        tracing::debug!(path = %temp_path.display(), "Failed to write to temporary file");
         format!(
             "Failed to write to temporary file '{}': disk may be full",
-            temp_path.display()
+            truncate_path(&temp_path)
         )
     })?;
 
     // Sync to disk to ensure data is persisted before rename
     temp_file.sync_all().with_context(|| {
-        let _ = std::fs::remove_file(&temp_path);
+        if let Err(e) = std::fs::remove_file(&temp_path) {
+            tracing::warn!(path = %temp_path.display(), error = %e, "Failed to clean up temp file");
+        }
+        tracing::debug!(path = %temp_path.display(), "Failed to sync temporary file");
         format!(
             "Failed to sync temporary file '{}' to disk: disk may be full",
-            temp_path.display()
+            truncate_path(&temp_path)
         )
     })?;
 
@@ -80,24 +100,68 @@ fn atomic_copy(src: &Path, dst: &Path) -> Result<()> {
     #[cfg(windows)]
     if dst.exists() {
         std::fs::remove_file(dst).with_context(|| {
-            let _ = std::fs::remove_file(&temp_path);
+            if let Err(e) = std::fs::remove_file(&temp_path) {
+                tracing::warn!(path = %temp_path.display(), error = %e, "Failed to clean up temp file");
+            }
             format!(
                 "Failed to remove existing '{}' before atomic replace",
-                dst.display()
+                truncate_path(dst)
             )
         })?;
     }
 
     std::fs::rename(&temp_path, dst).with_context(|| {
-        let _ = std::fs::remove_file(&temp_path);
+        if let Err(e) = std::fs::remove_file(&temp_path) {
+            tracing::warn!(path = %temp_path.display(), error = %e, "Failed to clean up temp file");
+        }
+        tracing::debug!(src = %temp_path.display(), dst = %dst.display(), "Failed to rename temp file");
         format!(
             "Failed to rename '{}' to '{}': check permissions",
-            temp_path.display(),
-            dst.display()
+            truncate_path(&temp_path),
+            truncate_path(dst)
         )
     })?;
 
     Ok(())
+}
+
+/// Remove old OPML backups, keeping the most recent `keep` files.
+fn rotate_opml_backups(config_dir: &Path, keep: usize) {
+    let mut backups: Vec<_> = match std::fs::read_dir(config_dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("feeds.opml.backup."))
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to read config directory for backup rotation");
+            return;
+        }
+    };
+
+    if backups.len() <= keep {
+        return;
+    }
+
+    // Sort by filename ascending (oldest first due to YYYYMMDD_HHMMSS format)
+    backups.sort_by_key(|e| e.file_name());
+
+    let to_remove = backups.len() - keep;
+    for entry in backups.into_iter().take(to_remove) {
+        let path = entry.path();
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to remove old OPML backup"
+            );
+        } else {
+            tracing::debug!(path = %path.display(), "Removed old OPML backup");
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -110,6 +174,10 @@ struct Args {
     /// Import OPML file (copies to config directory)
     #[arg(long, value_name = "FILE")]
     import: Option<PathBuf>,
+
+    /// Export feeds to OPML file
+    #[arg(long, value_name = "FILE")]
+    export: Option<PathBuf>,
 
     /// Rebuild the search index (FTS5)
     #[arg(long)]
@@ -124,6 +192,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    if args.import.is_some() && args.export.is_some() {
+        eprintln!("Error: --import and --export cannot be used together");
+        std::process::exit(1);
+    }
 
     // Set up config directory
     let config_dir = get_config_dir()?;
@@ -163,21 +236,32 @@ async fn main() -> Result<()> {
 
     // Handle --import flag
     if let Some(import_file) = &args.import {
-        // SEC-008: Canonicalize to resolve symlinks and prevent path traversal
-        let canonical_import = import_file
-            .canonicalize()
-            .with_context(|| format!("Failed to resolve import file: {}", import_file.display()))?;
+        // S-2: Open file first — binds FD to inode, closing TOCTOU window.
+        // We intentionally do NOT use O_NOFOLLOW: users may legitimately symlink OPML files.
+        let mut file = std::fs::File::open(import_file).with_context(|| {
+            tracing::debug!(path = %import_file.display(), "Failed to open import file");
+            format!("Failed to open import file: {}", truncate_path(import_file))
+        })?;
 
-        // Verify it's a regular file (not a directory, device, etc.)
-        let metadata = std::fs::metadata(&canonical_import)?;
+        // Check metadata on the open FD (not the path) — TOCTOU-safe
+        let metadata = file.metadata().with_context(|| {
+            format!(
+                "Failed to read file metadata: {}",
+                truncate_path(import_file)
+            )
+        })?;
         if !metadata.is_file() {
             anyhow::bail!("Import path must be a regular file");
         }
 
-        // Basic OPML validation: check for required elements
-        let content = std::fs::read_to_string(&canonical_import).with_context(|| {
-            format!("Failed to read import file: {}", canonical_import.display())
+        // Read from the FD (TOCTOU-safe: we read what we opened)
+        let mut content = String::new();
+        file.read_to_string(&mut content).with_context(|| {
+            tracing::debug!(path = %import_file.display(), "Failed to read import file");
+            format!("Failed to read import file: {}", truncate_path(import_file))
         })?;
+
+        // Basic OPML validation: check for required elements
         if !content.contains("<opml") && !content.contains("<outline") {
             anyhow::bail!("File does not appear to be valid OPML");
         }
@@ -190,28 +274,32 @@ async fn main() -> Result<()> {
 
             // Atomic backup: if this fails, original is untouched
             atomic_copy(&opml_path, &backup_path).with_context(|| {
+                tracing::debug!(path = %backup_path.display(), "Failed to create backup");
                 format!(
                     "Failed to create backup at '{}'. Original file is unchanged.",
-                    backup_path.display()
+                    truncate_path(&backup_path)
                 )
             })?;
 
             // Verify backup exists before proceeding
             if !backup_path.exists() {
+                tracing::debug!(path = %backup_path.display(), "Backup verification failed");
                 anyhow::bail!(
                     "Backup verification failed: '{}' was not created. Aborting import to protect existing data.",
-                    backup_path.display()
+                    truncate_path(&backup_path)
                 );
             }
             println!("Backed up existing OPML to: {}", backup_path.display());
+            rotate_opml_backups(&config_dir, 5);
         }
 
         // Atomic import: if this fails, the original file remains intact
         // (either unchanged if no backup was needed, or restorable from backup)
-        atomic_copy(&canonical_import, &opml_path).with_context(|| {
+        atomic_copy(import_file, &opml_path).with_context(|| {
+            tracing::debug!(path = %import_file.display(), "Failed to import OPML file");
             format!(
                 "Failed to import OPML file '{}'. If a backup was created, your previous feeds are preserved there.",
-                canonical_import.display()
+                truncate_path(import_file)
             )
         })?;
         println!("Imported OPML to: {}", opml_path.display());
@@ -280,12 +368,37 @@ async fn main() -> Result<()> {
         }
     };
 
+    // B-3: Spawn FTS consistency check BEFORE sync_feeds to avoid false positives
+    // from concurrent article inserts during the first refresh.
+    if !args.rebuild_search {
+        let db_check = db.clone();
+        tokio::spawn(async move {
+            match db_check.check_fts_consistency_detailed().await {
+                Ok(report) if report.is_consistent => {
+                    tracing::debug!("FTS5 index is consistent");
+                }
+                Ok(report) => {
+                    tracing::warn!(
+                        articles = report.articles_count,
+                        fts = report.fts_count,
+                        orphaned = report.orphaned_fts_entries,
+                        missing = report.missing_fts_entries,
+                        "FTS index inconsistent, run with --rebuild-search"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to check FTS5 consistency");
+                }
+            }
+        });
+    }
+
     // Sync feeds from OPML to database
     db.sync_feeds(&storage_feeds)
         .await
         .context("Failed to sync feeds")?;
 
-    // Handle --rebuild-search flag
+    // Handle --rebuild-search flag (synchronous -- explicitly requested by user)
     if args.rebuild_search {
         tracing::info!("Rebuilding search index...");
         let count = db
@@ -294,30 +407,35 @@ async fn main() -> Result<()> {
             .context("Failed to rebuild search index")?;
         tracing::info!(articles = count, "Search index rebuilt");
         println!("Search index rebuilt: {} articles indexed", count);
-    } else {
-        // Check FTS consistency on startup with detailed report
-        match db.check_fts_consistency_detailed().await {
-            Ok(report) if report.is_consistent => {
-                tracing::debug!("FTS5 index is consistent");
-            }
-            Ok(report) => {
-                tracing::warn!(
-                    articles = report.articles_count,
-                    fts = report.fts_count,
-                    orphaned = report.orphaned_fts_entries,
-                    missing = report.missing_fts_entries,
-                    "FTS index inconsistent, run with --rebuild-search"
-                );
-                eprintln!(
-                    "Warning: Search index is out of sync (missing: {}, orphaned: {}). Run with --rebuild-search to fix.",
-                    report.missing_fts_entries,
-                    report.orphaned_fts_entries
-                );
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to check FTS5 consistency");
-            }
+    }
+
+    // Handle --export flag
+    if let Some(export_path) = &args.export {
+        let parent = export_path.parent().unwrap_or(Path::new("."));
+        if !parent.exists() {
+            anyhow::bail!("Parent directory does not exist: {}", parent.display());
         }
+        let feeds = db.get_feeds_for_export().await?;
+        if feeds.is_empty() {
+            println!("No feeds to export.");
+            return Ok(());
+        }
+        // Convert storage::OpmlFeed to feed::OpmlFeed (identical fields, separate types)
+        let export_feeds: Vec<feed::OpmlFeed> = feeds
+            .into_iter()
+            .map(|f| feed::OpmlFeed {
+                title: f.title,
+                xml_url: f.xml_url,
+                html_url: f.html_url,
+            })
+            .collect();
+        feed::export_to_file(&export_feeds, export_path)?;
+        println!(
+            "Exported {} feeds to: {}",
+            export_feeds.len(),
+            export_path.display()
+        );
+        return Ok(());
     }
 
     // Create app state
@@ -333,8 +451,40 @@ async fn main() -> Result<()> {
     // PERF-005: Build feed title cache
     app.rebuild_feed_cache();
 
+    // Load config and preferences
+    let config_path = config_dir.join("config.toml");
+    let config = config::Config::load(&config_path).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "Failed to load config, using defaults");
+        config::Config::default()
+    });
+    let prefs = preferences::PreferenceManager::load(&config, &db)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Failed to load preferences, using defaults");
+            // Fallback: load from config alone (no DB)
+            preferences::PreferenceManager::from_config(&config)
+        });
+
+    // Restore session if enabled
+    if prefs.restore_session() {
+        if let Some(snapshot_json) = db.get_preference("session.snapshot").await.unwrap_or(None) {
+            match serde_json::from_str::<app::SessionSnapshot>(&snapshot_json) {
+                Ok(snapshot) => {
+                    app.restore(snapshot);
+                    app.set_status("Session restored");
+                    tracing::info!("Session restored from preferences");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Corrupt session snapshot, ignoring");
+                }
+            }
+        }
+    }
+
     // Create event channel for background tasks
-    let (event_tx, event_rx) = mpsc::channel::<AppEvent>(32);
+    // Sized for burst scenarios: 10 concurrent feed refreshes x progress/complete events
+    // + concurrent content loads + search results + star toggles
+    let (event_tx, event_rx) = mpsc::channel::<AppEvent>(256);
 
     // Run the TUI
     ui::run(&mut app, event_tx, event_rx).await?;
