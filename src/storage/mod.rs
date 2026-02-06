@@ -1,5 +1,6 @@
 mod articles;
 mod feeds;
+mod preferences;
 mod schema;
 mod search;
 mod types;
