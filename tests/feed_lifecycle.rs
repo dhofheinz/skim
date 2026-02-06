@@ -4,7 +4,7 @@
 //! These tests exercise the storage layer end-to-end, verifying that
 //! operations compose correctly across feeds, categories, and articles.
 
-use skim::storage::{Database, ParsedArticle};
+use skim::storage::{Database, ParsedArticle, SearchScope};
 
 async fn test_db() -> Database {
     Database::open(":memory:").await.unwrap()
@@ -194,14 +194,20 @@ async fn test_delete_feed_cleans_fts() {
     db.upsert_articles(feed_id, &articles).await.unwrap();
 
     // Verify FTS finds the article
-    let results = db.search_articles("Rust").await.unwrap();
+    let results = db
+        .search_articles("Rust", SearchScope::TitleAndSummary)
+        .await
+        .unwrap();
     assert_eq!(results.len(), 1);
 
     // Delete feed (cascades to articles, triggers FTS cleanup)
     db.delete_feed(feed_id).await.unwrap();
 
     // FTS should no longer find the article
-    let results = db.search_articles("Rust").await.unwrap();
+    let results = db
+        .search_articles("Rust", SearchScope::TitleAndSummary)
+        .await
+        .unwrap();
     assert!(
         results.is_empty(),
         "FTS should be cleaned up after feed deletion"
@@ -288,7 +294,10 @@ async fn test_full_lifecycle_subscribe_categorize_delete() {
     assert_eq!(&*rust_feed.title, "Official Rust Blog");
 
     // Step 6: Verify FTS works across feeds
-    let results = db.search_articles("Rust").await.unwrap();
+    let results = db
+        .search_articles("Rust", SearchScope::TitleAndSummary)
+        .await
+        .unwrap();
     assert_eq!(results.len(), 2, "Both Rust articles should match");
 
     // Step 7: Delete feed1 (Rust Blog)
@@ -301,7 +310,10 @@ async fn test_full_lifecycle_subscribe_categorize_delete() {
     assert_eq!(feeds[0].id, feed2);
 
     // Verify FTS only finds HN articles now
-    let results = db.search_articles("Rust").await.unwrap();
+    let results = db
+        .search_articles("Rust", SearchScope::TitleAndSummary)
+        .await
+        .unwrap();
     assert!(
         results.is_empty(),
         "Rust articles should be cleaned from FTS"

@@ -5,7 +5,8 @@
 
 use crate::app::{
     App, AppEvent, CachedArticleState, ConfirmAction, ContentState, ContextMenuState,
-    ContextMenuSubState, FetchResult, Focus, SubscribeState, View, CONTEXT_MENU_ITEMS,
+    ContextMenuSubState, FetchResult, Focus, ReadingSession, StatsData, SubscribeState, View,
+    CONTEXT_MENU_ITEMS,
 };
 use crate::feed::{discover_feed, refresh_all, refresh_one};
 use crate::keybindings::{Action as KbAction, Context as KbContext};
@@ -13,12 +14,12 @@ use crate::util::validate_url;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use super::helpers::{
     catch_task_panic, exit_search_mode, exit_starred_mode, restore_articles_from_search,
-    try_spawn_content_load, ERR_ARTICLE_NO_URL,
+    spawn_cached_ids_load, spawn_prefetch, try_spawn_content_load, ERR_ARTICLE_NO_URL,
 };
 use super::Action;
 use crate::util::{validate_url_for_open, MAX_SEARCH_QUERY_LENGTH};
@@ -64,12 +65,13 @@ pub(super) async fn handle_input(
 
     // Handle search mode input separately
     if app.search_mode {
-        return handle_search_input(app, code).await;
+        return handle_search_input(app, code, modifiers).await;
     }
 
     match app.view {
         View::Browse => handle_browse_input(app, code, modifiers, event_tx).await,
         View::Reader => handle_reader_input(app, code, modifiers, event_tx),
+        View::Stats => Ok(handle_stats_input(app, code, modifiers)),
     }
 }
 
@@ -104,7 +106,10 @@ async fn handle_browse_input(
     let action = app.keybindings.action_for_key(code, modifiers, context);
 
     match action {
-        Some(KbAction::Quit) => return Ok(Action::Quit),
+        Some(KbAction::Quit) => {
+            close_reading_session(app);
+            return Ok(Action::Quit);
+        }
         Some(KbAction::Back) => {
             // Priority: Dismiss What's New panel first, then exit starred mode
             if app.show_whats_new {
@@ -225,6 +230,9 @@ async fn handle_browse_input(
         Some(KbAction::ToggleStarredMode) => {
             handle_starred_mode_toggle(app).await?;
         }
+        Some(KbAction::ViewStats) => {
+            enter_stats_view(app, event_tx);
+        }
         Some(KbAction::MarkFeedRead) => {
             handle_mark_feed_read(app, event_tx).await;
         }
@@ -264,6 +272,21 @@ async fn handle_browse_input(
                     selected_item: 0,
                     sub_state: ContextMenuSubState::MainMenu,
                 });
+            }
+        }
+        Some(KbAction::Prefetch) => {
+            if app.prefetch_progress.is_some() {
+                app.set_status("Prefetch already in progress");
+            } else if let Some(feed) = app.selected_feed() {
+                let feed_id = feed.id;
+                let feed_title = feed.title.to_string();
+                app.set_status(format!("Prefetching articles for {}...", feed_title));
+                spawn_prefetch(
+                    feed_id,
+                    app.db.clone(),
+                    app.http_client.clone(),
+                    event_tx.clone(),
+                );
             }
         }
         _ => {}
@@ -653,6 +676,9 @@ async fn handle_enter_key(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) -> R
                     app.reader_article = Some(article.clone());
                     app.db.mark_article_read(article_id).await?;
 
+                    // Start reading session tracking
+                    start_reading_session(app, article.id, article.feed_id, event_tx);
+
                     try_spawn_content_load(app, &article, event_tx);
                 }
                 None => {
@@ -681,12 +707,20 @@ async fn handle_enter_key(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) -> R
             app.articles = Arc::new(app.db.get_articles_for_feed(feed_id, None).await?);
             app.selected_article = 0;
             app.clamp_selections();
+            // Load cached article IDs for cache indicators
+            let article_ids: Vec<i64> = app.articles.iter().map(|a| a.id).collect();
+            if !article_ids.is_empty() {
+                spawn_cached_ids_load(article_ids, app.db.clone(), event_tx.clone());
+            }
             app.focus = Focus::Articles;
         }
     } else if app.focus == Focus::Articles {
         // Enter reader view and spawn content loading task
         if let Some(article) = app.enter_reader() {
             app.db.mark_article_read(article.id).await?;
+
+            // Start reading session tracking
+            start_reading_session(app, article.id, article.feed_id, event_tx);
 
             // Spawn content loading task
             try_spawn_content_load(app, &article, event_tx);
@@ -1191,8 +1225,12 @@ pub(super) fn handle_reader_input(
         .action_for_key(code, modifiers, KbContext::Reader);
 
     match action {
-        Some(KbAction::Quit) => return Ok(Action::Quit),
+        Some(KbAction::Quit) => {
+            close_reading_session(app);
+            return Ok(Action::Quit);
+        }
         Some(KbAction::ExitReader) => {
+            close_reading_session(app);
             app.exit_reader();
         }
         Some(KbAction::ScrollDown) => {
@@ -1291,11 +1329,134 @@ fn handle_star_toggle_reader(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) {
     }
 }
 
+/// Enter the reading stats view and spawn async data loading.
+fn enter_stats_view(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) {
+    app.view = View::Stats;
+    app.stats_data = None;
+
+    let db = app.db.clone();
+    let tx = event_tx.clone();
+    tokio::spawn(catch_task_panic(async move {
+        let today = db.get_reading_stats(1).await.unwrap_or_default();
+        let week = db.get_reading_stats(7).await.unwrap_or_default();
+        let month = db.get_reading_stats(30).await.unwrap_or_default();
+        let _ = tx
+            .send(AppEvent::StatsLoaded(StatsData { today, week, month }))
+            .await;
+        Ok::<(), String>(())
+    }));
+}
+
+/// Handle input in the stats view.
+///
+/// Esc, q, or I dismisses the view and returns to Browse.
+fn handle_stats_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Action {
+    let action = app
+        .keybindings
+        .action_for_key(code, modifiers, KbContext::Global);
+
+    match action {
+        Some(KbAction::Quit) => {
+            close_reading_session(app);
+            return Action::Quit;
+        }
+        Some(KbAction::Back) | Some(KbAction::ViewStats) => {
+            app.view = View::Browse;
+            app.stats_data = None;
+        }
+        _ => {}
+    }
+
+    Action::Continue
+}
+
+/// Minimum reading session duration (seconds) to record.
+/// Sessions shorter than this are considered accidental and discarded.
+const MIN_SESSION_DURATION_SECS: u64 = 2;
+
+/// Start a new reading session for the given article.
+///
+/// Creates an in-memory session immediately (for timing), then spawns
+/// a background task to persist the open event to the database.
+/// The session's `history_id` is updated asynchronously via
+/// `AppEvent::ReadingSessionOpened`.
+fn start_reading_session(
+    app: &mut App,
+    article_id: i64,
+    feed_id: i64,
+    event_tx: &mpsc::Sender<AppEvent>,
+) {
+    app.reading_session = Some(ReadingSession {
+        history_id: 0,
+        article_id,
+        started_at: Instant::now(),
+    });
+
+    let db = app.db.clone();
+    let tx = event_tx.clone();
+    tokio::spawn(catch_task_panic(async move {
+        match db.record_open(article_id, feed_id).await {
+            Ok(id) => {
+                let _ = tx
+                    .send(AppEvent::ReadingSessionOpened { history_id: id })
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to record reading session open");
+            }
+        }
+        Ok::<(), String>(())
+    }));
+}
+
+/// Close the active reading session, if any.
+///
+/// Computes duration from `started_at.elapsed()`. Sessions shorter than
+/// `MIN_SESSION_DURATION_SECS` or without a confirmed `history_id` are discarded.
+/// The DB close is fire-and-forget (spawned, non-blocking).
+fn close_reading_session(app: &mut App) {
+    if let Some(session) = app.reading_session.take() {
+        let duration = session.started_at.elapsed().as_secs() as i64;
+        if duration >= MIN_SESSION_DURATION_SECS as i64 && session.history_id > 0 {
+            let db = app.db.clone();
+            let history_id = session.history_id;
+            tokio::spawn(catch_task_panic(async move {
+                if let Err(e) = db.record_close(history_id, duration).await {
+                    tracing::warn!(error = %e, history_id, "Failed to close reading session");
+                }
+                Ok::<(), String>(())
+            }));
+        }
+    }
+}
+
 /// Handle input in search mode.
-async fn handle_search_input(app: &mut App, code: KeyCode) -> Result<Action> {
+async fn handle_search_input(
+    app: &mut App,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> Result<Action> {
     match code {
         KeyCode::Esc => {
             exit_search_mode(app).await?;
+        }
+        // TASK-6: Ctrl+S toggles search scope and re-executes immediately
+        KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.search_scope = match app.search_scope {
+                crate::storage::SearchScope::TitleAndSummary => crate::storage::SearchScope::All,
+                crate::storage::SearchScope::All => crate::storage::SearchScope::TitleAndSummary,
+            };
+            let scope_label = match app.search_scope {
+                crate::storage::SearchScope::TitleAndSummary => "title + summary",
+                crate::storage::SearchScope::All => "all content",
+            };
+            app.set_status(format!("Search scope: {}", scope_label));
+            // Re-execute current query immediately (bypass debounce)
+            if !app.search_input.is_empty() {
+                app.search_debounce =
+                    Some(tokio::time::Instant::now() - Duration::from_millis(300));
+                app.pending_search = Some(app.search_input.clone());
+            }
         }
         KeyCode::Enter => {
             // Cancel any pending debounce - explicit search takes priority
@@ -1311,7 +1472,7 @@ async fn handle_search_input(app: &mut App, code: KeyCode) -> Result<Action> {
             if !query.is_empty() {
                 // Committing to search results - clear cache
                 app.cached_articles = None;
-                app.articles = Arc::new(app.db.search_articles(&query).await?);
+                app.articles = Arc::new(app.db.search_articles(&query, app.search_scope).await?);
                 app.selected_article = 0;
                 app.clamp_selections();
             } else {

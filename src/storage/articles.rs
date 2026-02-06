@@ -310,6 +310,7 @@ impl Database {
     ///
     /// * `article_id` - The database ID of the article
     /// * `content` - The full article content (markdown from jina.ai)
+    #[allow(dead_code)] // Used in integration tests; prefer index_content() which also triggers FTS5
     pub async fn set_article_content(&self, article_id: i64, content: &str) -> Result<()> {
         sqlx::query("UPDATE articles SET content = ? WHERE id = ?")
             .bind(content)

@@ -10,6 +10,7 @@ use crate::util::strip_control_chars;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 use super::reader::render_markdown;
 
@@ -71,20 +72,34 @@ fn round_robin_by_feed(
 ///
 /// Processes events like refresh completion, content loading results,
 /// and star toggle outcomes. Updates application state accordingly.
-pub(super) async fn handle_app_event(app: &mut App, event: AppEvent) {
+pub(super) async fn handle_app_event(
+    app: &mut App,
+    event: AppEvent,
+    event_tx: &mpsc::Sender<AppEvent>,
+) {
     match event {
         AppEvent::RefreshProgress(done, total) => {
             app.refresh_progress = Some((done, total));
         }
         AppEvent::RefreshComplete(results) => {
             handle_refresh_complete(app, results).await;
+            // Reload cached article IDs for cache indicators
+            let article_ids: Vec<i64> = app.articles.iter().map(|a| a.id).collect();
+            if !article_ids.is_empty() {
+                super::helpers::spawn_cached_ids_load(
+                    article_ids,
+                    app.db.clone(),
+                    event_tx.clone(),
+                );
+            }
         }
         AppEvent::ContentLoaded {
             article_id,
             generation,
             result,
+            cached,
         } => {
-            handle_content_loaded(app, article_id, generation, result);
+            handle_content_loaded(app, article_id, generation, result, cached);
         }
         AppEvent::FeedRateLimited {
             feed_title,
@@ -197,6 +212,50 @@ pub(super) async fn handle_app_event(app: &mut App, event: AppEvent) {
         AppEvent::FeedMoveFailed { feed_id, error } => {
             tracing::error!(feed_id, error = %error, "Feed move failed");
             app.set_status(format!("Move failed: {}", error));
+            app.needs_redraw = true;
+        }
+        AppEvent::ReadingSessionOpened { history_id } => {
+            if let Some(session) = &mut app.reading_session {
+                session.history_id = history_id;
+                tracing::debug!(history_id, "Reading session confirmed by DB");
+            }
+        }
+        AppEvent::StatsLoaded(data) => {
+            if app.view == View::Stats {
+                app.stats_data = Some(data);
+                app.needs_redraw = true;
+            }
+        }
+        AppEvent::PrefetchProgress { completed, total } => {
+            app.prefetch_progress = Some((completed, total));
+            app.set_status(format!("Prefetching: {}/{}...", completed + 1, total));
+            app.needs_redraw = true;
+        }
+        AppEvent::PrefetchComplete { succeeded, failed } => {
+            app.prefetch_progress = None;
+            if failed > 0 {
+                app.set_status(format!(
+                    "Prefetch done: {} cached, {} failed",
+                    succeeded, failed
+                ));
+            } else if succeeded > 0 {
+                app.set_status(format!("Prefetch done: {} articles cached", succeeded));
+            } else {
+                app.set_status("All articles already cached");
+            }
+            // Reload cached IDs for the current article list
+            let article_ids: Vec<i64> = app.articles.iter().map(|a| a.id).collect();
+            if !article_ids.is_empty() {
+                super::helpers::spawn_cached_ids_load(
+                    article_ids,
+                    app.db.clone(),
+                    event_tx.clone(),
+                );
+            }
+            app.needs_redraw = true;
+        }
+        AppEvent::CachedIdsLoaded(ids) => {
+            app.cached_article_set = ids;
             app.needs_redraw = true;
         }
     }
@@ -428,6 +487,7 @@ fn handle_content_loaded(
     article_id: i64,
     generation: u64,
     result: Result<String, crate::content::ContentError>,
+    cached: bool,
 ) {
     // BUG-010: Check generation first to prevent stale content race conditions.
     // If user rapidly navigates A->B->A, we may receive content from the first A
@@ -447,7 +507,8 @@ fn handle_content_loaded(
     if let Some(ref reader_article) = app.reader_article {
         if reader_article.id == article_id {
             // This is the content we wanted - apply it and clear tracking
-            tracing::debug!(article_id, generation, "Content loaded successfully");
+            let source = if cached { "cached" } else { "fetched" };
+            tracing::debug!(article_id, generation, source, "Content loaded");
             app.content_loading_for = None;
 
             match result {
@@ -463,6 +524,8 @@ fn handle_content_loaded(
                     };
                     // PERF-022: Clear negative cache on success
                     app.failed_content_cache.remove(&article_id);
+                    // Update cache indicator
+                    app.cached_article_set.insert(article_id);
                 }
                 Err(e) => {
                     let fallback = reader_article.summary.clone();

@@ -43,6 +43,8 @@ pub enum Action {
     CollapseCategory,
     ExpandCategory,
     ContextMenu,
+    Prefetch,
+    ViewStats,
 }
 
 impl Action {
@@ -80,6 +82,8 @@ impl Action {
             Self::CollapseCategory => "Collapse category",
             Self::ExpandCategory => "Expand category",
             Self::ContextMenu => "Feed context menu",
+            Self::Prefetch => "Prefetch articles for offline",
+            Self::ViewStats => "View reading stats",
         }
     }
 }
@@ -303,6 +307,11 @@ impl KeybindingRegistry {
             KeySpec::plain(KeyCode::Char('S')),
             Action::ToggleStarredMode,
         );
+        self.bind(
+            Context::Global,
+            KeySpec::plain(KeyCode::Char('I')),
+            Action::ViewStats,
+        );
 
         // Search
         self.bind(
@@ -361,6 +370,13 @@ impl KeybindingRegistry {
             Context::FeedList,
             KeySpec::plain(KeyCode::Char('m')),
             Action::ContextMenu,
+        );
+
+        // Prefetch articles for offline reading (feed list context)
+        self.bind(
+            Context::FeedList,
+            KeySpec::plain(KeyCode::Char('P')),
+            Action::Prefetch,
         );
 
         // Theme + Help (new actions)
@@ -612,6 +628,7 @@ fn parse_action_name(name: &str) -> Option<Action> {
         "collapse_category" | "collapsecategory" => Some(Action::CollapseCategory),
         "expand_category" | "expandcategory" => Some(Action::ExpandCategory),
         "context_menu" | "contextmenu" | "menu" => Some(Action::ContextMenu),
+        "view_stats" | "viewstats" | "stats" => Some(Action::ViewStats),
         _ => None,
     }
 }

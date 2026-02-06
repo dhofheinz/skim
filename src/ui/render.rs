@@ -12,7 +12,7 @@ use ratatui::{
     Frame,
 };
 
-use super::{articles, categories, feeds, help, reader, status, whatsnew};
+use super::{articles, categories, feeds, help, reader, stats, status, whatsnew};
 
 /// Minimum terminal dimensions required for normal operation.
 pub(super) const MIN_WIDTH: u16 = 60;
@@ -50,6 +50,7 @@ pub(super) fn render(f: &mut Frame, app: &mut App) {
     match app.view {
         View::Browse => render_browse(f, app),
         View::Reader => render_reader(f, app),
+        View::Stats => stats::render(f, app),
     }
 
     // Render help overlay on top of any view when active

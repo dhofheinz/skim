@@ -30,6 +30,7 @@ mod input;
 mod loop_runner;
 pub mod reader;
 mod render;
+mod stats;
 mod status;
 mod whatsnew;
 

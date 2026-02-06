@@ -8,6 +8,7 @@ use crate::content::fetch_content;
 use crate::storage::{Article, Database};
 use anyhow::Result;
 use futures::FutureExt;
+use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
@@ -336,9 +337,10 @@ pub(super) fn try_spawn_content_load(
     true
 }
 
-/// Spawn a background task to load article content with caching.
+/// Spawn a background task to load article content with cache-aware flow.
 ///
-/// Checks the database cache first, fetching from jina.ai on cache miss.
+/// Checks content_cache table first (TTL-aware), then articles.content column,
+/// then fetches from jina.ai on miss. Caches fetched content and indexes for FTS5.
 /// Sends `AppEvent::ContentLoaded` on completion (success or failure).
 ///
 /// # Arguments
@@ -367,14 +369,15 @@ pub(super) fn spawn_content_load(
     tokio::spawn(async move {
         let tx_panic = tx.clone();
         match catch_task_panic(async {
-            // Check cache first
-            if let Ok(Some(cached)) = db.get_article_content(article_id).await {
-                tracing::debug!(article_id, generation, "content cache hit");
+            // 1. Check content_cache table (TTL-aware)
+            if let Ok(Some(cached)) = db.get_cached_content(article_id).await {
+                tracing::debug!(article_id, generation, "content_cache hit");
                 if let Err(e) = tx
                     .send(AppEvent::ContentLoaded {
                         article_id,
                         generation,
-                        result: Ok(cached),
+                        result: Ok(cached.markdown),
+                        cached: true,
                     })
                     .await
                 {
@@ -383,19 +386,45 @@ pub(super) fn spawn_content_load(
                 return;
             }
 
-            // Cache miss - fetch from jina.ai
+            // 2. Check articles.content column (legacy fallback)
+            if let Ok(Some(content)) = db.get_article_content(article_id).await {
+                tracing::debug!(article_id, generation, "articles.content hit, migrating to cache");
+                // Migrate legacy content into content_cache for future TTL-aware lookups
+                if let Err(e) = db.cache_content(article_id, &content, None).await {
+                    tracing::warn!(article_id, error = %e, "Failed to migrate content to cache");
+                }
+                if let Err(e) = tx
+                    .send(AppEvent::ContentLoaded {
+                        article_id,
+                        generation,
+                        result: Ok(content),
+                        cached: true,
+                    })
+                    .await
+                {
+                    tracing::warn!(error = %e, event = "ContentLoaded", "Channel send failed (receiver dropped)");
+                }
+                return;
+            }
+
+            // 3. Cache miss — fetch from jina.ai
             let result = fetch_content(&client, &url, None).await;
 
-            // Store in cache on success
-            if let Ok(ref content) = result {
-                if let Err(e) = db.set_article_content(article_id, content).await {
-                    tracing::warn!(article_id, error = %e, "failed to cache content");
+            // On success: cache content, update articles.content, index for FTS5
+            if let Ok(ref markdown) = result {
+                if let Err(e) = db.cache_content(article_id, markdown, None).await {
+                    tracing::warn!(article_id, error = %e, "Failed to cache content");
                     let _ = tx
                         .send(AppEvent::ContentCacheFailed {
                             article_id,
                             error: e.to_string(),
                         })
                         .await;
+                }
+                // Index content for FTS5 full-text search (TASK-3)
+                // Also writes articles.content via UPDATE trigger
+                if let Err(e) = db.index_content(article_id, markdown).await {
+                    tracing::warn!(article_id, error = %e, "Failed to index content for FTS5");
                 }
             }
 
@@ -404,6 +433,7 @@ pub(super) fn spawn_content_load(
                     article_id,
                     generation,
                     result,
+                    cached: false,
                 })
                 .await
             {
@@ -424,4 +454,132 @@ pub(super) fn spawn_content_load(
             }
         }
     })
+}
+
+/// Spawn a background task to load cached article IDs for the current article list.
+///
+/// Sends `AppEvent::CachedIdsLoaded` with the set of article IDs that have valid
+/// content_cache entries. Used to populate `app.cached_article_set` for UI indicators.
+pub(super) fn spawn_cached_ids_load(
+    article_ids: Vec<i64>,
+    db: Database,
+    tx: mpsc::Sender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        match db.cached_article_ids(&article_ids).await {
+            Ok(ids) => {
+                let set: HashSet<i64> = ids.into_iter().collect();
+                let _ = tx.send(AppEvent::CachedIdsLoaded(set)).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to load cached article IDs");
+            }
+        }
+    });
+}
+
+/// Spawn a background prefetch task for a feed's unread articles.
+///
+/// Fetches up to `limit` unread articles without cache entries, caching each one.
+/// Sends `PrefetchProgress` and `PrefetchComplete` events.
+pub(super) fn spawn_prefetch(
+    feed_id: i64,
+    db: Database,
+    client: reqwest::Client,
+    tx: mpsc::Sender<AppEvent>,
+) {
+    const PREFETCH_LIMIT: i64 = 50;
+
+    tokio::spawn(async move {
+        let tx_panic = tx.clone();
+        match catch_task_panic(async {
+            let candidates = match db
+                .prefetch_candidates_for_feed(feed_id, PREFETCH_LIMIT)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to get prefetch candidates");
+                    let _ = tx
+                        .send(AppEvent::PrefetchComplete {
+                            succeeded: 0,
+                            failed: 0,
+                        })
+                        .await;
+                    return;
+                }
+            };
+
+            let total = candidates.len();
+            if total == 0 {
+                let _ = tx
+                    .send(AppEvent::PrefetchComplete {
+                        succeeded: 0,
+                        failed: 0,
+                    })
+                    .await;
+                return;
+            }
+
+            let mut succeeded = 0;
+            let mut failed = 0;
+
+            for (i, article_id) in candidates.iter().enumerate() {
+                let _ = tx
+                    .send(AppEvent::PrefetchProgress {
+                        completed: i,
+                        total,
+                    })
+                    .await;
+
+                // Look up article to get URL
+                let article = match db.get_article_by_id(*article_id).await {
+                    Ok(Some(a)) => a,
+                    _ => {
+                        failed += 1;
+                        continue;
+                    }
+                };
+
+                let url = match article.url.as_deref() {
+                    Some(u) => u,
+                    None => {
+                        failed += 1;
+                        continue;
+                    }
+                };
+
+                match fetch_content(&client, url, None).await {
+                    Ok(markdown) => {
+                        // Cache content (non-fatal on error)
+                        let _ = db.cache_content(*article_id, &markdown, None).await;
+                        // index_content writes articles.content AND triggers FTS5 update
+                        let _ = db.index_content(*article_id, &markdown).await;
+                        succeeded += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(article_id, error = %e, "Prefetch failed for article");
+                        failed += 1;
+                    }
+                }
+            }
+
+            let _ = tx
+                .send(AppEvent::PrefetchComplete { succeeded, failed })
+                .await;
+        })
+        .await
+        {
+            Ok(()) => {}
+            Err(panic_msg) => {
+                tracing::error!(task = "prefetch", error = %panic_msg, "Prefetch task panicked");
+                let _ = tx_panic
+                    .send(AppEvent::TaskPanicked {
+                        task: "prefetch",
+                        error: panic_msg,
+                    })
+                    .await;
+            }
+        }
+    });
 }

@@ -1,7 +1,7 @@
 use crate::content::ContentError;
 use crate::feed::DiscoveredFeed;
 use crate::keybindings::KeybindingRegistry;
-use crate::storage::{Article, Database, Feed, FeedCategory};
+use crate::storage::{Article, Database, Feed, FeedCategory, SearchScope};
 use crate::theme::{StyleMap, ThemeVariant};
 use anyhow::Result;
 use ratatui::style::Style;
@@ -50,6 +50,22 @@ impl Default for SessionSnapshot {
             scroll_offset: 0,
         }
     }
+}
+
+// ============================================================================
+// Reading Session Tracking
+// ============================================================================
+
+/// Tracks an active reading session for duration recording.
+///
+/// Created when the user enters reader view, consumed when they exit.
+/// The `history_id` starts at 0 (placeholder) and is updated asynchronously
+/// once the DB confirms the insert via `AppEvent::ReadingSessionOpened`.
+pub struct ReadingSession {
+    pub history_id: i64,
+    #[allow(dead_code)] // Used by TASK-8 (reading stats panel) for session context
+    pub article_id: i64,
+    pub started_at: std::time::Instant,
 }
 
 // ============================================================================
@@ -135,6 +151,16 @@ fn create_redirect_policy() -> Policy {
 pub enum View {
     Browse, // Side-by-side feeds/articles
     Reader, // Full-screen article reader
+    Stats,  // Reading statistics panel
+}
+
+/// Aggregated stats for multiple time windows.
+///
+/// Loaded asynchronously when entering `View::Stats`.
+pub struct StatsData {
+    pub today: crate::storage::ReadingStats,
+    pub week: crate::storage::ReadingStats,
+    pub month: crate::storage::ReadingStats,
 }
 
 /// Which panel has focus in Browse view
@@ -277,10 +303,12 @@ pub enum AppEvent {
     /// - `article_id`: The article this content belongs to
     /// - `generation`: The generation counter when this load was spawned
     /// - `result`: The content or error from fetching
+    /// - `cached`: True if content was served from content_cache table
     ContentLoaded {
         article_id: i64,
         generation: u64,
         result: Result<String, ContentError>,
+        cached: bool,
     },
     FeedRateLimited {
         feed_title: Arc<str>, // PERF-016: Zero-copy from Feed.title
@@ -408,6 +436,27 @@ pub enum AppEvent {
         feed_id: i64,
         error: String,
     },
+    /// Reading session opened — DB confirmed the history row insert.
+    ///
+    /// Updates the in-memory `ReadingSession.history_id` so that
+    /// `record_close` can be called with the correct ID on reader exit.
+    ReadingSessionOpened {
+        history_id: i64,
+    },
+    /// Prefetch progress update.
+    PrefetchProgress {
+        completed: usize,
+        total: usize,
+    },
+    /// Prefetch batch completed.
+    PrefetchComplete {
+        succeeded: usize,
+        failed: usize,
+    },
+    /// Cached article IDs loaded (batch query result for cache indicators).
+    CachedIdsLoaded(HashSet<i64>),
+    /// Reading stats loaded for the stats panel.
+    StatsLoaded(StatsData),
 }
 
 // ============================================================================
@@ -460,10 +509,22 @@ pub struct App {
     pub search_debounce: Option<Instant>,
     /// PERF-006: Pending search query
     pub pending_search: Option<String>,
+    /// TASK-6: Current search scope — persists across search sessions
+    pub search_scope: SearchScope,
 
     // Content loading
     pub content_state: ContentState,
     pub reader_article: Option<Article>, // The article currently being read
+
+    /// Active reading session for duration tracking.
+    ///
+    /// Set on reader entry, consumed on reader exit or app quit.
+    /// Sessions shorter than 2 seconds are discarded (accidental enters).
+    pub reading_session: Option<ReadingSession>,
+
+    /// Stats data loaded asynchronously for View::Stats.
+    /// None when stats are loading or not yet requested.
+    pub stats_data: Option<StatsData>,
 
     // Refresh progress
     pub refresh_progress: Option<(usize, usize)>,
@@ -512,6 +573,13 @@ pub struct App {
     /// Maps article_id -> failure time. Prevents repeated network requests
     /// for articles whose content fetch recently failed (5-minute TTL).
     pub failed_content_cache: HashMap<i64, Instant>,
+
+    /// Set of article IDs that have valid cache entries (for UI indicators).
+    /// Loaded via batch query when articles list changes.
+    pub cached_article_set: HashSet<i64>,
+
+    /// Progress of ongoing prefetch operation: (completed, total).
+    pub prefetch_progress: Option<(usize, usize)>,
 
     /// Generation counter for content loading to handle race conditions.
     ///
@@ -625,8 +693,11 @@ impl App {
             search_feed_id: None,
             search_debounce: None,
             pending_search: None,
+            search_scope: SearchScope::default(),
             content_state: ContentState::Idle,
             reader_article: None,
+            reading_session: None,
+            stats_data: None,
             refresh_progress: None,
             status_message: None,
             whats_new: Vec::new(),
@@ -643,6 +714,8 @@ impl App {
             needs_redraw: true,
             content_loading_for: None,
             failed_content_cache: HashMap::new(),
+            cached_article_set: HashSet::new(),
+            prefetch_progress: None,
             content_load_generation: 0,
             content_load_handle: None,
             search_generation: 0,

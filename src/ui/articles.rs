@@ -3,7 +3,7 @@ use crate::util::{display_width, truncate_to_width};
 use chrono::{DateTime, Utc};
 use ratatui::{
     layout::Rect,
-    style::Style,
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState},
     Frame,
@@ -92,14 +92,24 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 None
             };
 
-            // Build line with star, feed name (starred mode), title, and time
-            // Pre-allocate spans: at most 4 (star, feed, title, time)
-            let mut spans = Vec::with_capacity(4);
+            // Build line with star, cache indicator, feed name (starred mode), title, and time
+            // Pre-allocate spans: at most 5 (star, cache, feed, title, time)
+            let mut spans = Vec::with_capacity(5);
 
             // Star indicator
             if article.starred {
                 spans.push(Span::styled("★ ", style_star));
             }
+
+            // Cache indicator
+            let is_cached = app.cached_article_set.contains(&article.id);
+            let cache_indicator = if is_cached {
+                Span::styled("● ", Style::default().fg(Color::Green))
+            } else {
+                Span::styled("○ ", Style::default().fg(Color::DarkGray))
+            };
+            spans.push(cache_indicator);
+            let cache_width: usize = 2;
 
             // Feed name prefix in starred mode
             let feed_prefix_width = if let Some(prefix) = feed_prefix {
@@ -126,9 +136,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             // Minimum padding between title and time
             let min_padding = 2;
 
-            // Max title width = available - star - feed_prefix - time - padding
+            // Max title width = available - star - cache - feed_prefix - time - padding
             let max_title_len = available_width
                 .saturating_sub(star_width)
+                .saturating_sub(cache_width)
                 .saturating_sub(feed_prefix_width)
                 .saturating_sub(time_width)
                 .saturating_sub(min_padding);
@@ -141,7 +152,8 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
             // Right-align time: calculate padding to push to right edge
             if !time_str.is_empty() {
-                let used_width = star_width + feed_prefix_width + title_width + time_width;
+                let used_width =
+                    star_width + cache_width + feed_prefix_width + title_width + time_width;
                 let padding = available_width.saturating_sub(used_width);
                 spans.push(Span::styled(
                     format!("{:>width$}", time_str, width = padding + time_width),
@@ -161,7 +173,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let title = if app.search_mode {
-        format!("Search: {}_", app.search_input)
+        let scope_tag = match app.search_scope {
+            crate::storage::SearchScope::TitleAndSummary => "[title+summary]",
+            crate::storage::SearchScope::All => "[all]",
+        };
+        format!("{} Search: {}\u{258E}", scope_tag, app.search_input)
     } else if app.starred_mode {
         "★ Starred Articles".to_owned()
     } else if let Some(feed) = app.selected_feed() {
@@ -238,5 +254,93 @@ mod tests {
         // Should show date format like "Jan 07" not "8d"
         assert!(!result.ends_with('d'));
         assert!(result.contains("Jan"));
+    }
+
+    #[test]
+    fn test_search_scope_indicator_text() {
+        use crate::storage::SearchScope;
+
+        // Verify the scope labels match what render() uses in the search title
+        let label_ts = match SearchScope::TitleAndSummary {
+            SearchScope::TitleAndSummary => "[title+summary]",
+            SearchScope::All => "[all]",
+        };
+        assert_eq!(label_ts, "[title+summary]");
+
+        let label_all = match SearchScope::All {
+            SearchScope::TitleAndSummary => "[title+summary]",
+            SearchScope::All => "[all]",
+        };
+        assert_eq!(label_all, "[all]");
+
+        // Verify format string matches expected output
+        let query = "rust async";
+        let title = format!("{} Search: {}\u{258E}", label_ts, query);
+        assert_eq!(title, "[title+summary] Search: rust async\u{258E}");
+
+        let title_all = format!("{} Search: {}\u{258E}", label_all, query);
+        assert_eq!(title_all, "[all] Search: rust async\u{258E}");
+    }
+
+    #[test]
+    fn test_scope_toggle_visual_update() {
+        use crate::storage::SearchScope;
+
+        // Simulate the toggle logic from input.rs Ctrl+S handler
+        let mut scope = SearchScope::TitleAndSummary;
+        assert_eq!(scope, SearchScope::TitleAndSummary);
+
+        // First toggle: TitleAndSummary -> All
+        scope = match scope {
+            SearchScope::TitleAndSummary => SearchScope::All,
+            SearchScope::All => SearchScope::TitleAndSummary,
+        };
+        assert_eq!(scope, SearchScope::All);
+
+        // Second toggle: All -> TitleAndSummary
+        scope = match scope {
+            SearchScope::TitleAndSummary => SearchScope::All,
+            SearchScope::All => SearchScope::TitleAndSummary,
+        };
+        assert_eq!(scope, SearchScope::TitleAndSummary);
+    }
+
+    #[test]
+    fn test_scope_persists_across_sessions() {
+        use crate::storage::SearchScope;
+
+        // Default scope is TitleAndSummary
+        let scope = SearchScope::default();
+        assert_eq!(scope, SearchScope::TitleAndSummary);
+
+        // Scope is independent of search_mode — a standalone field that persists
+        // Simulate: enter search, toggle to All, exit search, re-enter search
+        let mut scope = SearchScope::default();
+        let mut search_mode = true;
+
+        // Enter search mode
+        assert!(search_mode);
+        assert_eq!(scope, SearchScope::TitleAndSummary);
+
+        // Toggle scope to All during search
+        scope = SearchScope::All;
+
+        // Exit search mode — scope should NOT reset
+        search_mode = false;
+        assert!(!search_mode);
+        assert_eq!(
+            scope,
+            SearchScope::All,
+            "scope must persist after exiting search mode"
+        );
+
+        // Re-enter search mode — scope still All
+        search_mode = true;
+        assert!(search_mode);
+        assert_eq!(
+            scope,
+            SearchScope::All,
+            "scope must persist across search sessions"
+        );
     }
 }

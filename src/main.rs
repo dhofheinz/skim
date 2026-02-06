@@ -438,6 +438,18 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Evict expired content cache entries at startup (once per session)
+    match db.evict_expired().await {
+        Ok(evicted) => {
+            if evicted > 0 {
+                tracing::info!(evicted, "Evicted expired content cache entries");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to evict expired cache entries");
+        }
+    }
+
     // Create app state
     let mut app = App::new(db.clone()).context("Failed to create application")?;
 

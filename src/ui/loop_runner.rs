@@ -104,7 +104,7 @@ pub async fn run(
         // starvation where typing while content is loading delays content display.
         while let Ok(event) = event_rx.try_recv() {
             app.needs_redraw = true;
-            handle_app_event(app, event).await;
+            handle_app_event(app, event, &event_tx).await;
         }
 
         // Platform-specific signal futures
@@ -149,7 +149,7 @@ pub async fn run(
             // Background task events (blocking recv for when queue was empty)
             Some(event) = event_rx.recv() => {
                 app.needs_redraw = true;
-                handle_app_event(app, event).await;
+                handle_app_event(app, event, &event_tx).await;
             }
 
             // Periodic tick for status expiry and debounced search
@@ -240,11 +240,12 @@ fn spawn_search(app: &mut App, query: String, event_tx: &mpsc::Sender<AppEvent>)
     let db = app.db.clone();
     let tx = event_tx.clone();
     let query_for_task = query.clone();
+    let scope = app.search_scope;
 
-    tracing::debug!(query = %query, generation, "Spawning async search task");
+    tracing::debug!(query = %query, ?scope, generation, "Spawning async search task");
 
     app.search_handle = Some(tokio::spawn(async move {
-        let results = db.search_articles(&query_for_task).await;
+        let results = db.search_articles(&query_for_task, scope).await;
         let event = AppEvent::SearchCompleted {
             query: query_for_task,
             generation,

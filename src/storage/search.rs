@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::Result;
 
 use super::schema::Database;
-use super::types::{Article, ArticleDbRow, DatabaseError, FtsConsistencyReport};
+use super::types::{Article, ArticleDbRow, DatabaseError, FtsConsistencyReport, SearchScope};
 
 // ============================================================================
 // FTS5 Query Validation
@@ -88,6 +88,11 @@ fn validate_fts_query(query: &str) -> Result<()> {
                 current_term_len = 0;
             }
             b'"' => { /* decorator, skip */ }
+            // SEC-012: Reject FTS5 column filter syntax to prevent scope bypass
+            // e.g., `{content} : secret` would bypass TitleAndSummary scope
+            b'{' | b'}' => {
+                anyhow::bail!("Search query contains invalid characters");
+            }
             b' ' | b'\t' => {
                 max_term_len = max_term_len.max(current_term_len);
                 current_term_len = 0;
@@ -153,11 +158,15 @@ impl Database {
     // Search Operations
     // ========================================================================
 
-    /// Search articles by title or summary
-    /// Uses FTS5 for fast search with LIKE fallback for syntax errors or timeout
-    /// PERF-003: Hard cap at MAX_ARTICLES (2000) to prevent OOM
-    /// SEC-012: FTS5 query wrapped with 5s timeout to prevent CPU-bound DoS
-    pub async fn search_articles(&self, query: &str) -> Result<Vec<Article>> {
+    /// Search articles using FTS5 with configurable scope.
+    ///
+    /// `SearchScope::TitleAndSummary` restricts to title+summary columns (original behavior).
+    /// `SearchScope::All` searches title, summary, AND content for full-text search.
+    ///
+    /// Uses FTS5 for fast search with LIKE fallback for syntax errors or timeout.
+    /// PERF-003: Hard cap at MAX_ARTICLES (2000) to prevent OOM.
+    /// SEC-012: FTS5 query wrapped with 5s timeout to prevent CPU-bound DoS.
+    pub async fn search_articles(&self, query: &str, scope: SearchScope) -> Result<Vec<Article>> {
         // Early return for empty/whitespace-only queries
         let query = query.trim();
         if query.is_empty() {
@@ -167,7 +176,13 @@ impl Database {
         // Validate query complexity to prevent DoS via expensive wildcard expansions
         validate_fts_query(query)?;
 
-        tracing::debug!(limit = MAX_ARTICLES, query = %query, "search_articles with limit cap");
+        tracing::debug!(limit = MAX_ARTICLES, query = %query, scope = ?scope, "search_articles with limit cap");
+
+        // Build FTS5 MATCH expression: column filter for TitleAndSummary, bare query for All
+        let fts_query = match scope {
+            SearchScope::TitleAndSummary => format!("{{title summary}} : {}", query),
+            SearchScope::All => query.to_string(),
+        };
 
         // PERF-002: Try FTS5 MATCH first for fast search
         // SEC-012: Wrap with timeout to prevent CPU-bound queries from blocking
@@ -184,7 +199,7 @@ impl Database {
                 LIMIT ?
             "#,
             )
-            .bind(query)
+            .bind(&fts_query)
             .bind(MAX_ARTICLES)
             .fetch_all(&self.pool),
         )
@@ -202,6 +217,21 @@ impl Database {
                 self.like_fallback(query).await
             }
         }
+    }
+
+    /// Update the FTS5 content column for a specific article.
+    ///
+    /// Sets `articles.content` which triggers the FTS5 UPDATE trigger to sync
+    /// the content into the search index.
+    #[allow(dead_code)] // Consumed by TASK-4, TASK-6
+    pub async fn index_content(&self, article_id: i64, content: &str) -> Result<(), DatabaseError> {
+        sqlx::query("UPDATE articles SET content = ? WHERE id = ?")
+            .bind(content)
+            .bind(article_id)
+            .execute(&self.pool)
+            .await
+            .map_err(DatabaseError::from_sqlx)?;
+        Ok(())
     }
 
     /// LIKE-based search fallback when FTS5 fails or times out.
@@ -344,7 +374,7 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::{Database, OpmlFeed, ParsedArticle};
+    use crate::storage::{Database, OpmlFeed, ParsedArticle, SearchScope};
 
     async fn test_db() -> Database {
         Database::open(":memory:").await.unwrap()
@@ -384,7 +414,10 @@ mod tests {
         .await
         .unwrap();
 
-        let results = db.search_articles("Rust").await.unwrap();
+        let results = db
+            .search_articles("Rust", SearchScope::TitleAndSummary)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(&*results[0].title, "Rust Programming Guide");
     }
@@ -392,7 +425,10 @@ mod tests {
     #[tokio::test]
     async fn test_search_empty_query() {
         let db = test_db().await;
-        let results = db.search_articles("").await.unwrap();
+        let results = db
+            .search_articles("", SearchScope::TitleAndSummary)
+            .await
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -405,7 +441,10 @@ mod tests {
             .await
             .unwrap();
 
-        let results = db.search_articles("nonexistent").await.unwrap();
+        let results = db
+            .search_articles("nonexistent", SearchScope::TitleAndSummary)
+            .await
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -449,7 +488,10 @@ mod tests {
         let count = db.rebuild_fts_index().await.unwrap();
         assert_eq!(count, 3);
 
-        let results = db.search_articles("Rust").await.unwrap();
+        let results = db
+            .search_articles("Rust", SearchScope::TitleAndSummary)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(&*results[0].title, "Rust Programming");
     }
@@ -526,14 +568,38 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(db.search_articles("Important").await.unwrap().len(), 1);
-        assert_eq!(db.search_articles("Another").await.unwrap().len(), 1);
+        assert_eq!(
+            db.search_articles("Important", SearchScope::TitleAndSummary)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.search_articles("Another", SearchScope::TitleAndSummary)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         let count = db.rebuild_fts_index().await.unwrap();
         assert_eq!(count, 2);
 
-        assert_eq!(db.search_articles("Important").await.unwrap().len(), 1);
-        assert_eq!(db.search_articles("Another").await.unwrap().len(), 1);
+        assert_eq!(
+            db.search_articles("Important", SearchScope::TitleAndSummary)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.search_articles("Another", SearchScope::TitleAndSummary)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -681,7 +747,9 @@ mod tests {
     async fn test_search_articles_rejects_long_query() {
         let db = test_db().await;
         let long_query = "a".repeat(super::MAX_SEARCH_QUERY_LENGTH + 1);
-        let result = db.search_articles(&long_query).await;
+        let result = db
+            .search_articles(&long_query, SearchScope::TitleAndSummary)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("maximum length"));
     }
@@ -689,7 +757,9 @@ mod tests {
     #[tokio::test]
     async fn test_search_articles_rejects_too_many_wildcards() {
         let db = test_db().await;
-        let result = db.search_articles("a* b* c* d*").await;
+        let result = db
+            .search_articles("a* b* c* d*", SearchScope::TitleAndSummary)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("wildcards"));
     }
@@ -697,7 +767,12 @@ mod tests {
     #[tokio::test]
     async fn test_search_articles_rejects_too_many_or() {
         let db = test_db().await;
-        let result = db.search_articles("a OR b OR c OR d OR e OR f OR g").await;
+        let result = db
+            .search_articles(
+                "a OR b OR c OR d OR e OR f OR g",
+                SearchScope::TitleAndSummary,
+            )
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("OR operators"));
     }
@@ -706,7 +781,10 @@ mod tests {
     async fn test_search_articles_rejects_too_many_parentheses() {
         let db = test_db().await;
         let result = db
-            .search_articles("(a) AND (b) AND (c) AND (d) AND (e) AND (f)")
+            .search_articles(
+                "(a) AND (b) AND (c) AND (d) AND (e) AND (f)",
+                SearchScope::TitleAndSummary,
+            )
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("parentheses"));
@@ -716,7 +794,10 @@ mod tests {
     async fn test_search_articles_rejects_too_many_and() {
         let db = test_db().await;
         let result = db
-            .search_articles("a AND b AND c AND d AND e AND f AND g AND h AND i AND j AND k AND l")
+            .search_articles(
+                "a AND b AND c AND d AND e AND f AND g AND h AND i AND j AND k AND l",
+                SearchScope::TitleAndSummary,
+            )
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("AND operators"));
@@ -772,5 +853,144 @@ mod tests {
     fn test_validate_fts_query_flat_parens_ok() {
         // 5 parens but only depth 1
         assert!(super::validate_fts_query("(a) AND (b) AND (c) AND (d) AND (e)").is_ok());
+    }
+
+    #[test]
+    fn test_validate_fts_query_rejects_column_filter_syntax() {
+        // SEC-012: Reject { and } to prevent FTS5 column filter injection
+        let result = super::validate_fts_query("{content} : secret");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid characters"));
+
+        let result = super::validate_fts_query("foo OR {content} : bar");
+        assert!(result.is_err());
+
+        // Closing brace alone also rejected
+        let result = super::validate_fts_query("test}");
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // TASK-3: Full-content FTS5 tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_fts5_content_column_indexed() {
+        let db = test_db().await;
+        db.sync_feeds(&[test_feed(1)]).await.unwrap();
+        let feeds = db.get_feeds_with_unread_counts().await.unwrap();
+
+        db.upsert_articles(feeds[0].id, &[test_article("1", "Generic Title")])
+            .await
+            .unwrap();
+
+        // Store unique content via index_content
+        let articles = db.get_articles_for_feed(feeds[0].id, None).await.unwrap();
+        db.index_content(articles[0].id, "UniqueContentMarker xyz789")
+            .await
+            .unwrap();
+
+        // SearchScope::All should find it via content
+        let results = db
+            .search_articles("UniqueContentMarker", SearchScope::All)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(&*results[0].title, "Generic Title");
+
+        // SearchScope::TitleAndSummary should NOT find it (only in content)
+        let results = db
+            .search_articles("UniqueContentMarker", SearchScope::TitleAndSummary)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_index_content() {
+        let db = test_db().await;
+        db.sync_feeds(&[test_feed(1)]).await.unwrap();
+        let feeds = db.get_feeds_with_unread_counts().await.unwrap();
+
+        db.upsert_articles(feeds[0].id, &[test_article("1", "Article")])
+            .await
+            .unwrap();
+
+        let articles = db.get_articles_for_feed(feeds[0].id, None).await.unwrap();
+        let article_id = articles[0].id;
+
+        // Index content
+        db.index_content(article_id, "Full markdown body here")
+            .await
+            .unwrap();
+
+        // Verify content is stored and searchable
+        let results = db
+            .search_articles("markdown", SearchScope::All)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, article_id);
+    }
+
+    #[tokio::test]
+    async fn test_search_title_and_summary_scope() {
+        let db = test_db().await;
+        db.sync_feeds(&[test_feed(1)]).await.unwrap();
+        let feeds = db.get_feeds_with_unread_counts().await.unwrap();
+
+        db.upsert_articles(feeds[0].id, &[test_article("1", "Rust Programming Guide")])
+            .await
+            .unwrap();
+
+        // Title match works with TitleAndSummary scope
+        let results = db
+            .search_articles("Rust", SearchScope::TitleAndSummary)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Summary match works with TitleAndSummary scope ("Test summary" from test_article)
+        let results = db
+            .search_articles("summary", SearchScope::TitleAndSummary)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_search_all_scope() {
+        let db = test_db().await;
+        db.sync_feeds(&[test_feed(1)]).await.unwrap();
+        let feeds = db.get_feeds_with_unread_counts().await.unwrap();
+
+        db.upsert_articles(feeds[0].id, &[test_article("1", "Plain Title")])
+            .await
+            .unwrap();
+
+        let articles = db.get_articles_for_feed(feeds[0].id, None).await.unwrap();
+        db.index_content(articles[0].id, "Deep content about quantum computing")
+            .await
+            .unwrap();
+
+        // All scope finds content
+        let results = db
+            .search_articles("quantum", SearchScope::All)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+
+        // All scope also finds title
+        let results = db.search_articles("Plain", SearchScope::All).await.unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_search_scope_default_unchanged() {
+        // Verify SearchScope::default() is TitleAndSummary
+        assert_eq!(SearchScope::default(), SearchScope::TitleAndSummary);
     }
 }

@@ -907,7 +907,10 @@ mod tests {
 
         // Verify FTS entry exists before deletion
         let results = db
-            .search_articles("Unique Searchable Content")
+            .search_articles(
+                "Unique Searchable Content",
+                crate::storage::SearchScope::TitleAndSummary,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -921,7 +924,10 @@ mod tests {
 
         // FTS should return no results
         let results = db
-            .search_articles("Unique Searchable Content")
+            .search_articles(
+                "Unique Searchable Content",
+                crate::storage::SearchScope::TitleAndSummary,
+            )
             .await
             .unwrap();
         assert!(results.is_empty(), "FTS entries should be cleaned up");

@@ -196,66 +196,54 @@ impl Database {
         .execute(&mut *tx)
         .await?;
 
-        // PERF-002: Add FTS5 virtual table
+        // PERF-002 / TASK-3: FTS5 virtual table with title, summary, AND content columns.
+        // Drop + recreate ensures existing databases upgrade from the old 2-column schema.
+        // Safe: FTS5 is a derived index — source data lives in the articles table.
+        sqlx::query("DROP TRIGGER IF EXISTS articles_fts_insert")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DROP TRIGGER IF EXISTS articles_fts_update")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DROP TRIGGER IF EXISTS articles_fts_delete")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DROP TABLE IF EXISTS articles_fts")
+            .execute(&mut *tx)
+            .await?;
+
         sqlx::query(
             r#"
             CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts
-            USING fts5(title, summary, content=articles, content_rowid=id)
+            USING fts5(title, summary, content, content=articles, content_rowid=id)
         "#,
         )
         .execute(&mut *tx)
         .await?;
 
-        // Populate FTS5 with existing data (safe to run multiple times)
-        // BUG-007: Handle errors explicitly - only treat "no such table" as expected
-        // Use proper SQLx error type matching instead of string containment
-        let fts_count: (i64,) = match sqlx::query_as("SELECT COUNT(*) FROM articles_fts")
+        // Repopulate FTS5 from articles table (includes content column)
+        let article_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM articles")
             .fetch_one(&mut *tx)
             .await
-        {
-            Ok(row) => row,
-            Err(sqlx::Error::Database(db_err)) => {
-                // SQLite error code 1 (SQLITE_ERROR) is used for "no such table"
-                // We still need string check as fallback since error codes vary
-                if db_err.message().contains("no such table") {
-                    tracing::debug!("FTS table does not exist yet, treating as empty");
-                    (0,)
-                } else {
-                    tracing::warn!(error = %db_err, "FTS table query failed");
-                    return Err(sqlx::Error::Database(db_err).into());
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "FTS table query failed (non-database error)");
-                return Err(e.into());
-            }
-        };
+            .unwrap_or((0,));
 
-        if fts_count.0 == 0 {
-            // Only populate if empty (first run or fresh db)
-            let article_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM articles")
-                .fetch_one(&mut *tx)
-                .await
-                .unwrap_or((0,));
-
-            if article_count.0 > 0 {
-                sqlx::query(
-                    r#"
-                    INSERT INTO articles_fts(rowid, title, summary)
-                    SELECT id, title, summary FROM articles
-                "#,
-                )
-                .execute(&mut *tx)
-                .await?;
-            }
+        if article_count.0 > 0 {
+            sqlx::query(
+                r#"
+                INSERT INTO articles_fts(rowid, title, summary, content)
+                SELECT id, title, summary, COALESCE(content, '') FROM articles
+            "#,
+            )
+            .execute(&mut *tx)
+            .await?;
         }
 
-        // Sync triggers
+        // Sync triggers (include content column)
         sqlx::query(
             r#"
             CREATE TRIGGER IF NOT EXISTS articles_fts_insert AFTER INSERT ON articles BEGIN
-                INSERT INTO articles_fts(rowid, title, summary)
-                VALUES (new.id, new.title, new.summary);
+                INSERT INTO articles_fts(rowid, title, summary, content)
+                VALUES (new.id, new.title, new.summary, COALESCE(new.content, ''));
             END
         "#,
         )
@@ -265,8 +253,8 @@ impl Database {
         sqlx::query(
             r#"
             CREATE TRIGGER IF NOT EXISTS articles_fts_delete AFTER DELETE ON articles BEGIN
-                INSERT INTO articles_fts(articles_fts, rowid, title, summary)
-                VALUES ('delete', old.id, old.title, old.summary);
+                INSERT INTO articles_fts(articles_fts, rowid, title, summary, content)
+                VALUES ('delete', old.id, old.title, old.summary, COALESCE(old.content, ''));
             END
         "#,
         )
@@ -276,10 +264,10 @@ impl Database {
         sqlx::query(
             r#"
             CREATE TRIGGER IF NOT EXISTS articles_fts_update AFTER UPDATE ON articles BEGIN
-                INSERT INTO articles_fts(articles_fts, rowid, title, summary)
-                VALUES ('delete', old.id, old.title, old.summary);
-                INSERT INTO articles_fts(rowid, title, summary)
-                VALUES (new.id, new.title, new.summary);
+                INSERT INTO articles_fts(articles_fts, rowid, title, summary, content)
+                VALUES ('delete', old.id, old.title, old.summary, COALESCE(old.content, ''));
+                INSERT INTO articles_fts(rowid, title, summary, content)
+                VALUES (new.id, new.title, new.summary, COALESCE(new.content, ''));
             END
         "#,
         )
@@ -322,6 +310,56 @@ impl Database {
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         "#,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // Create content_cache table for TTL-based article content caching
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS content_cache (
+                article_id INTEGER NOT NULL UNIQUE REFERENCES articles(id) ON DELETE CASCADE,
+                markdown TEXT NOT NULL,
+                fetched_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL
+            )
+        "#,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_content_cache_expires ON content_cache(expires_at)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        // Note: No explicit index on article_id — the UNIQUE constraint creates an implicit one
+
+        // Create reading_history table for tracking article reading sessions
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS reading_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+                feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
+                opened_at TEXT NOT NULL,
+                closed_at TEXT,
+                duration_seconds INTEGER
+            )
+        "#,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_reading_history_opened ON reading_history(opened_at DESC)",
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_reading_history_article ON reading_history(article_id)",
         )
         .execute(&mut *tx)
         .await?;

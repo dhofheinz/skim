@@ -50,6 +50,23 @@ impl DatabaseError {
 }
 
 // ============================================================================
+// Search Types
+// ============================================================================
+
+/// Controls which FTS5 columns are searched.
+///
+/// `TitleAndSummary` (default) restricts to title+summary columns, matching
+/// the original behavior. `All` includes the `content` column for full-text
+/// search across cached article bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchScope {
+    #[default]
+    TitleAndSummary,
+    #[allow(dead_code)] // Consumed by TASK-6, TASK-9
+    All,
+}
+
+// ============================================================================
 // FTS5 Consistency Report
 // ============================================================================
 
@@ -87,6 +104,64 @@ pub struct FeedCategory {
     pub name: String,
     pub parent_id: Option<i64>,
     pub sort_order: i64,
+}
+
+// ============================================================================
+// Reading History Types
+// ============================================================================
+
+/// Aggregated reading statistics over a configurable time window.
+///
+/// Computed by `get_reading_stats(days)` from the `reading_history` table.
+/// Consumed by TASK-8 (reading stats panel).
+#[derive(Debug, Default)]
+#[allow(dead_code)] // articles_per_day available for extended stats display
+pub struct ReadingStats {
+    pub articles_per_day: f64,
+    pub total_minutes: u64,
+    pub top_feeds: Vec<(String, u32)>,
+}
+
+/// A single entry from the reading history log.
+///
+/// Includes denormalized article and feed titles for display.
+/// Consumed by TASK-8 (reading stats panel).
+#[derive(Debug)]
+#[allow(dead_code)] // Consumed by downstream tasks (TASK-8)
+pub struct ReadingHistoryEntry {
+    pub id: i64,
+    pub article_id: i64,
+    pub article_title: String,
+    pub feed_title: String,
+    pub opened_at: String,
+    pub duration_seconds: Option<i64>,
+}
+
+// ============================================================================
+// Content Cache Types
+// ============================================================================
+
+/// Cached article content with TTL metadata.
+///
+/// Stored in `content_cache` table. The `expires_at` field enables TTL-based
+/// eviction without touching the main `articles` table.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields read by TASK-7 (offline indicator) and TASK-10 (cache tests)
+pub struct CachedContent {
+    pub article_id: i64,
+    pub markdown: String,
+    pub fetched_at: String,
+    pub expires_at: String,
+    pub size_bytes: i64,
+}
+
+/// Aggregate statistics for the content cache.
+#[allow(dead_code)] // Consumed by TASK-8 (stats panel)
+pub struct CacheStats {
+    pub total_entries: i64,
+    pub total_size_bytes: i64,
+    pub oldest_entry: Option<String>,
+    pub newest_entry: Option<String>,
 }
 
 // ============================================================================
