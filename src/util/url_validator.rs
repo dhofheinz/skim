@@ -20,6 +20,10 @@ pub enum UrlValidationError {
     /// The URL points to localhost.
     #[error("Localhost not allowed")]
     Localhost,
+    /// SEC-015: The URL contains userinfo (user:pass@host), which can be used for
+    /// credential injection via attacker-controlled HTML link tags.
+    #[error("URLs with embedded credentials are not allowed")]
+    UserInfoPresent,
 }
 
 /// Validates a URL string for use as a feed source.
@@ -69,6 +73,12 @@ pub fn validate_url(url_str: &str) -> Result<Url, UrlValidationError> {
     match url.scheme() {
         "http" | "https" => {}
         scheme => return Err(UrlValidationError::UnsupportedScheme(scheme.to_owned())),
+    }
+
+    // SEC-015: Reject URLs with embedded credentials (e.g. https://user:pass@evil.com/feed)
+    // reachable via attacker-controlled HTML link tags in feed content
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(UrlValidationError::UserInfoPresent);
     }
 
     if let Some(host) = url.host_str() {
@@ -161,6 +171,7 @@ pub fn validate_url_for_open(url_str: &str) -> Result<(), &'static str> {
             // Should not reach here since scheme is checked above
             "URL must use http or https scheme"
         }
+        UrlValidationError::UserInfoPresent => "URL must not contain user credentials",
     })?;
 
     Ok(())
@@ -274,6 +285,33 @@ mod tests {
     fn test_ipv4_mapped_ipv6_private_rejected() {
         assert!(validate_url("http://[::ffff:192.168.1.1]/feed").is_err());
         assert!(validate_url("http://[::ffff:10.0.0.1]/feed").is_err());
+    }
+
+    // SEC-015: Userinfo rejection
+
+    #[test]
+    fn test_userinfo_username_only_rejected() {
+        let result = validate_url("https://admin@example.com/feed");
+        assert!(matches!(result, Err(UrlValidationError::UserInfoPresent)));
+    }
+
+    #[test]
+    fn test_userinfo_username_password_rejected() {
+        let result = validate_url("https://user:pass@example.com/feed");
+        assert!(matches!(result, Err(UrlValidationError::UserInfoPresent)));
+    }
+
+    #[test]
+    fn test_userinfo_encoded_rejected() {
+        // Percent-encoded credentials should still be caught by the URL parser
+        let result = validate_url("https://us%65r:p%61ss@example.com/feed");
+        assert!(matches!(result, Err(UrlValidationError::UserInfoPresent)));
+    }
+
+    #[test]
+    fn test_no_userinfo_accepted() {
+        assert!(validate_url("https://example.com/feed").is_ok());
+        assert!(validate_url("https://example.com:8080/feed").is_ok());
     }
 
     // --- validate_url_for_open tests ---
@@ -445,5 +483,13 @@ mod tests {
     fn test_validate_url_for_open_rejects_backslash() {
         let result = validate_url_for_open("https://example.com/\\evil");
         assert_eq!(result, Err("URL contains potentially unsafe characters"));
+    }
+
+    // SEC-015: Userinfo rejection in validate_url_for_open
+
+    #[test]
+    fn test_validate_url_for_open_rejects_userinfo() {
+        let result = validate_url_for_open("https://user:pass@example.com/feed");
+        assert_eq!(result, Err("URL must not contain user credentials"));
     }
 }
