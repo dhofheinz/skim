@@ -31,4 +31,4 @@ mod opml;
 mod parser;
 
 pub use fetcher::{refresh_all, refresh_one};
-pub use opml::parse;
+pub use opml::{export_to_file, parse, OpmlFeed};

