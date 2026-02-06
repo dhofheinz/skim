@@ -1,12 +1,55 @@
 use crate::content::ContentError;
+use crate::keybindings::KeybindingRegistry;
 use crate::storage::{Article, Database, Feed};
+use crate::theme::{StyleMap, ThemeVariant};
 use anyhow::Result;
+use ratatui::style::Style;
 use ratatui::text::Line;
 use reqwest::redirect::Policy;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::Instant;
 use unicode_width::UnicodeWidthStr;
+
+/// Maximum scroll offset for the reader view (ratatui u16 limit).
+pub const MAX_SCROLL: usize = u16::MAX as usize;
+
+// ============================================================================
+// Session Snapshot
+// ============================================================================
+
+/// Serializable snapshot of App state for session persistence.
+///
+/// Uses string representations for enums to maintain forward-compatibility:
+/// if new variants are added, old snapshots with unknown strings will use
+/// `#[serde(default)]` fallbacks instead of failing to deserialize.
+///
+/// Always restores to Browse view — Reader view state is transient.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+#[allow(dead_code)] // Used by TASK-13 (session restore)
+pub struct SessionSnapshot {
+    /// Focus panel name: "feeds", "articles", or "whatsnew".
+    pub focus: String,
+    /// Selected feed index.
+    pub selected_feed: usize,
+    /// Selected article index.
+    pub selected_article: usize,
+    /// Scroll offset in reader/article list.
+    pub scroll_offset: usize,
+}
+
+impl Default for SessionSnapshot {
+    fn default() -> Self {
+        Self {
+            focus: "feeds".to_string(),
+            selected_feed: 0,
+            selected_article: 0,
+            scroll_offset: 0,
+        }
+    }
+}
 
 // ============================================================================
 // Cached Article State (PERF-008)
@@ -28,6 +71,22 @@ pub struct CachedArticleState {
     pub articles: Arc<Vec<Article>>,
     /// Selected article index at time of caching
     pub selected: usize,
+}
+
+// ============================================================================
+// What's New Entry (PERF-022)
+// ============================================================================
+
+/// Lightweight entry for What's New panel.
+///
+/// Stores only display data to avoid duplicating full Article structs.
+/// Full Article data is fetched from DB on demand (e.g., when entering reader).
+#[derive(Clone)]
+pub struct WhatsNewEntry {
+    pub article_id: i64,
+    pub feed_title: Arc<str>,
+    pub title: Arc<str>,
+    pub published: Option<i64>,
 }
 
 // ============================================================================
@@ -126,6 +185,7 @@ pub struct FetchResult {
 }
 
 /// Events from background tasks
+#[allow(dead_code)] // BulkMarkRead variants constructed by UI keybind handlers (TASK-5)
 pub enum AppEvent {
     RefreshProgress(usize, usize),
     RefreshComplete(Vec<FetchResult>),
@@ -178,6 +238,37 @@ pub enum AppEvent {
         generation: u64,
         results: Result<Vec<Article>, String>,
     },
+    /// Bulk mark-read operation completed successfully.
+    ///
+    /// Fields:
+    /// - `feed_id`: The feed whose articles were marked read, or None for all feeds
+    /// - `count`: Number of articles actually marked as read
+    BulkMarkReadComplete {
+        feed_id: Option<i64>,
+        count: u64,
+    },
+    /// Bulk mark-read operation failed.
+    ///
+    /// Fields:
+    /// - `feed_id`: The feed that was targeted, or None for all feeds
+    /// - `error`: Description of the failure
+    BulkMarkReadFailed {
+        feed_id: Option<i64>,
+        error: String,
+    },
+    /// OPML export completed successfully.
+    ///
+    /// Fields:
+    /// - `count`: Number of feeds exported
+    /// - `path`: Filesystem path where the OPML file was written
+    ExportComplete {
+        count: usize,
+        path: String,
+    },
+    /// OPML export failed.
+    ExportFailed {
+        error: String,
+    },
 }
 
 // ============================================================================
@@ -188,6 +279,18 @@ pub enum AppEvent {
 pub struct App {
     pub db: Database,
     pub http_client: reqwest::Client,
+
+    // Theme
+    /// Current theme variant (for cycling).
+    pub theme_variant: ThemeVariant,
+    /// Active style map for all UI rendering.
+    /// Initialized from `ThemeVariant::Dark` and switchable at runtime.
+    pub theme: StyleMap,
+
+    // Keybindings
+    /// Keybinding registry for action-key mapping with config overrides.
+    #[allow(dead_code)] // Used by TASK-11 (keybinding dispatch refactor)
+    pub keybindings: KeybindingRegistry,
 
     // Data
     /// Feed list wrapped in Arc for O(1) cloning during refresh (PERF-011).
@@ -226,12 +329,12 @@ pub struct App {
     // Refresh progress
     pub refresh_progress: Option<(usize, usize)>,
 
-    // Status message with expiry
-    pub status_message: Option<(String, Instant)>,
+    // P-8: Status message with expiry — Cow avoids allocation for static literals
+    pub status_message: Option<(Cow<'static, str>, Instant)>,
 
     // What's New panel - shows recent articles after refresh
-    // PERF-009: Uses Arc<str> for feed titles to avoid cloning
-    pub whats_new: Vec<(Arc<str>, Article)>,
+    // PERF-023: Lightweight entries instead of full Article clones
+    pub whats_new: Vec<WhatsNewEntry>,
     pub whats_new_selected: usize,
     pub show_whats_new: bool,
 
@@ -255,6 +358,11 @@ pub struct App {
 
     /// Track article ID currently being fetched to prevent duplicate requests
     pub content_loading_for: Option<i64>,
+
+    /// PERF-022: Negative cache for failed content loads.
+    /// Maps article_id -> failure time. Prevents repeated network requests
+    /// for articles whose content fetch recently failed (5-minute TTL).
+    pub failed_content_cache: HashMap<i64, Instant>,
 
     /// Generation counter for content loading to handle race conditions.
     ///
@@ -299,6 +407,17 @@ pub struct App {
     ///
     /// Incremented by the tick handler when content is loading.
     pub spinner_frame: usize,
+
+    /// PERF-020: Cached reader content line count: (viewport_width, total_content_lines).
+    ///
+    /// Avoids recomputing wrapped line widths on every scroll clamp (j/k keypress).
+    /// Invalidated when content state changes or viewport width changes.
+    pub reader_cached_line_count: Option<(usize, usize)>,
+
+    /// Whether the help overlay is currently displayed.
+    pub show_help: bool,
+    /// Scroll offset in the help screen for long keybinding lists.
+    pub help_scroll_offset: usize,
 }
 
 impl App {
@@ -306,15 +425,19 @@ impl App {
         // PERF-019: Configure HTTP client with connection pooling and keepalive
         let http_client = reqwest::Client::builder()
             .redirect(create_redirect_policy())
-            .pool_max_idle_per_host(5) // Limit idle connections per host
-            .pool_idle_timeout(std::time::Duration::from_secs(90)) // Close idle connections after 90s
+            .pool_max_idle_per_host(4) // P-7: 4 idle conns per host improves throughput for domain-heavy reading
+            .pool_idle_timeout(std::time::Duration::from_secs(30)) // Close idle connections promptly
             .tcp_keepalive(std::time::Duration::from_secs(60)) // TCP keepalive probes
             .timeout(std::time::Duration::from_secs(30)) // Default request timeout
+            // TODO: TASK-10: .http2_adaptive_window(true) method not available in reqwest 0.13
             .build()?;
 
         Ok(Self {
             db,
             http_client,
+            theme_variant: ThemeVariant::Dark,
+            theme: StyleMap::from_palette(&ThemeVariant::Dark.palette()),
+            keybindings: KeybindingRegistry::new(),
             feeds: Arc::new(Vec::new()),
             articles: Arc::new(Vec::new()),
             view: View::Browse,
@@ -341,6 +464,7 @@ impl App {
             cached_articles: None,
             needs_redraw: true,
             content_loading_for: None,
+            failed_content_cache: HashMap::new(),
             content_load_generation: 0,
             content_load_handle: None,
             search_generation: 0,
@@ -348,7 +472,38 @@ impl App {
             reader_visible_lines: 0,
             reader_viewport_width: 0,
             spinner_frame: 0,
+            reader_cached_line_count: None,
+            show_help: false,
+            help_scroll_offset: 0,
         })
+    }
+
+    /// Resolve a semantic role name to its `Style`.
+    ///
+    /// Convenience method that delegates to `StyleMap::resolve`.
+    /// Returns `Style::default()` for unknown roles.
+    #[allow(dead_code)] // Used by downstream tasks (TASK-10, TASK-12)
+    pub fn style(&self, role: &str) -> Style {
+        self.theme.resolve(role)
+    }
+
+    /// Switch to a different theme variant at runtime.
+    ///
+    /// Rebuilds the `StyleMap` from the new variant's palette and
+    /// marks the UI as needing a full redraw.
+    pub fn set_theme(&mut self, variant: ThemeVariant) {
+        self.theme_variant = variant;
+        self.theme = StyleMap::from_palette(&variant.palette());
+        self.needs_redraw = true;
+    }
+
+    /// Cycle to the next theme variant (Dark → Light → Dark).
+    ///
+    /// Returns the name of the new theme for status display.
+    pub fn cycle_theme(&mut self) -> &'static str {
+        let next = self.theme_variant.next();
+        self.set_theme(next);
+        next.name()
     }
 
     /// PERF-005: Rebuild feed title cache from current feeds list
@@ -508,7 +663,7 @@ impl App {
     ///
     /// Note: Available as a safe access pattern for What's New items.
     #[allow(dead_code)]
-    pub fn selected_whats_new(&mut self) -> Option<&(Arc<str>, Article)> {
+    pub fn selected_whats_new(&mut self) -> Option<&WhatsNewEntry> {
         if self.whats_new.is_empty() {
             self.whats_new_selected = 0;
             return None;
@@ -590,7 +745,7 @@ impl App {
     /// * `visible_lines` - Number of lines visible in the viewport (excluding borders)
     pub fn clamp_scroll(&mut self, content_lines: usize, visible_lines: usize) {
         let max_scroll = content_lines.saturating_sub(visible_lines);
-        self.scroll_offset = self.scroll_offset.min(max_scroll);
+        self.scroll_offset = self.scroll_offset.min(max_scroll).min(MAX_SCROLL);
     }
 
     /// Get the number of display lines in the reader view (accounting for wrapping).
@@ -598,9 +753,19 @@ impl App {
     /// Calculates wrapped line count based on viewport width. Each logical line
     /// may wrap to multiple display lines depending on its width.
     /// Includes the 3-line header.
+    ///
+    /// PERF-020: Uses cached line count when available to avoid recomputing
+    /// wrapped line widths on every scroll clamp.
     pub fn reader_content_lines(&self) -> usize {
         const HEADER_LINES: usize = 3; // Title, feed/time, blank line
         let width = self.reader_viewport_width.max(1); // Avoid division by zero
+
+        // PERF-020: Return cached value if viewport width matches
+        if let Some((cached_width, cached_count)) = self.reader_cached_line_count {
+            if cached_width == width {
+                return HEADER_LINES + cached_count;
+            }
+        }
 
         let content_lines = match &self.content_state {
             ContentState::Idle => 1,
@@ -629,25 +794,58 @@ impl App {
 
     /// Calculate how many display lines a single Line will occupy after wrapping.
     fn wrapped_line_count(line: &Line<'_>, viewport_width: usize) -> usize {
+        let width = viewport_width.max(1);
         let line_width: usize = line.spans.iter().map(|s| s.content.width()).sum();
         if line_width == 0 {
             1 // Empty lines still take one line
         } else {
-            line_width.div_ceil(viewport_width)
+            line_width.div_ceil(width)
         }
+    }
+
+    /// PERF-020: Compute and cache the reader content line count for the current viewport width.
+    ///
+    /// This pre-populates `reader_cached_line_count` so that subsequent calls to
+    /// `reader_content_lines()` (which takes `&self`) can return the cached value
+    /// without recomputing wrapped line widths.
+    pub fn cache_reader_line_count(&mut self) {
+        let width = self.reader_viewport_width.max(1);
+        let content_lines = match &self.content_state {
+            ContentState::Idle => 1,
+            ContentState::Loading { .. } => 1,
+            ContentState::Loaded { rendered_lines, .. } => rendered_lines
+                .iter()
+                .map(|line| Self::wrapped_line_count(line, width))
+                .sum(),
+            ContentState::Failed { fallback, .. } => {
+                let base = 2;
+                let summary_lines = fallback.as_ref().map_or(0, |s| {
+                    2 + s
+                        .lines()
+                        .map(|l| l.width().max(1).div_ceil(width))
+                        .sum::<usize>()
+                });
+                base + summary_lines
+            }
+        };
+        self.reader_cached_line_count = Some((width, content_lines));
     }
 
     /// Clamp scroll offset to content bounds using stored viewport size.
     ///
     /// Convenience method that uses `reader_visible_lines` from last render.
     /// Call this after scroll operations in the reader view.
+    ///
+    /// PERF-020: Pre-populates the line count cache before reading it,
+    /// so subsequent scroll clamps on the same content are O(1).
     pub fn clamp_reader_scroll(&mut self) {
+        self.cache_reader_line_count();
         let content_lines = self.reader_content_lines();
         self.clamp_scroll(content_lines, self.reader_visible_lines);
     }
 
     /// Set status message (will auto-expire after 3 seconds)
-    pub fn set_status(&mut self, msg: impl Into<String>) {
+    pub fn set_status(&mut self, msg: impl Into<Cow<'static, str>>) {
         self.status_message = Some((msg.into(), Instant::now()));
     }
 
@@ -683,7 +881,41 @@ impl App {
         self.scroll_offset = 0;
         self.content_state = ContentState::Loading { article_id };
         self.reader_article = Some(article.clone());
+        self.reader_cached_line_count = None; // PERF-020: Invalidate cache on reader entry
         Some(article)
+    }
+
+    /// Capture current App state as a serializable snapshot.
+    #[allow(dead_code)] // Used by TASK-13 (session restore)
+    pub fn snapshot(&self) -> SessionSnapshot {
+        let focus = match self.focus {
+            Focus::WhatsNew => "whatsnew",
+            Focus::Feeds => "feeds",
+            Focus::Articles => "articles",
+        };
+        SessionSnapshot {
+            focus: focus.to_string(),
+            selected_feed: self.selected_feed,
+            selected_article: self.selected_article,
+            scroll_offset: self.scroll_offset,
+        }
+    }
+
+    /// Restore App state from a snapshot with bounds clamping.
+    ///
+    /// Always restores to Browse view. Unknown focus values default to Feeds.
+    #[allow(dead_code)] // Used by TASK-13 (session restore)
+    pub fn restore(&mut self, snapshot: SessionSnapshot) {
+        self.view = View::Browse;
+        self.focus = match snapshot.focus.as_str() {
+            "whatsnew" => Focus::WhatsNew,
+            "articles" => Focus::Articles,
+            _ => Focus::Feeds,
+        };
+        self.selected_feed = snapshot.selected_feed;
+        self.selected_article = snapshot.selected_article;
+        self.scroll_offset = snapshot.scroll_offset;
+        self.clamp_selections();
     }
 
     /// Exit reader view back to browse
@@ -699,6 +931,7 @@ impl App {
         self.content_loading_for = None; // BUG-001: Clear loading flag on view exit
         self.scroll_offset = 0;
         self.reader_article = None;
+        self.reader_cached_line_count = None; // PERF-020: Invalidate cache on reader exit
     }
 }
 
@@ -1053,5 +1286,388 @@ mod tests {
 
         // Loaded: 3 header + 50 content = 53
         assert_eq!(app.reader_content_lines(), 53);
+    }
+
+    // SessionSnapshot tests
+    #[tokio::test]
+    async fn test_snapshot_captures_state() {
+        let mut app = test_app().await;
+        app.feeds = Arc::new(vec![test_feed(1, "A"), test_feed(2, "B")]);
+        app.focus = Focus::Articles;
+        app.selected_feed = 1;
+        app.selected_article = 3;
+        app.scroll_offset = 10;
+
+        let snap = app.snapshot();
+        assert_eq!(snap.focus, "articles");
+        assert_eq!(snap.selected_feed, 1);
+        assert_eq!(snap.selected_article, 3);
+        assert_eq!(snap.scroll_offset, 10);
+    }
+
+    #[tokio::test]
+    async fn test_restore_applies_state() {
+        let mut app = test_app().await;
+        app.feeds = Arc::new(vec![test_feed(1, "A"), test_feed(2, "B")]);
+
+        let snap = SessionSnapshot {
+            focus: "articles".to_string(),
+            selected_feed: 1,
+            selected_article: 0,
+            scroll_offset: 5,
+        };
+
+        app.restore(snap);
+        assert_eq!(app.view, View::Browse);
+        assert_eq!(app.focus, Focus::Articles);
+        assert_eq!(app.selected_feed, 1);
+        assert_eq!(app.scroll_offset, 5);
+    }
+
+    #[tokio::test]
+    async fn test_restore_clamps_out_of_bounds() {
+        let mut app = test_app().await;
+        // No feeds loaded — indices should clamp to 0
+        let snap = SessionSnapshot {
+            focus: "feeds".to_string(),
+            selected_feed: 999,
+            selected_article: 999,
+            scroll_offset: 0,
+        };
+
+        app.restore(snap);
+        assert_eq!(app.selected_feed, 0);
+        assert_eq!(app.selected_article, 0);
+    }
+
+    #[tokio::test]
+    async fn test_restore_unknown_focus_defaults_to_feeds() {
+        let mut app = test_app().await;
+        let snap = SessionSnapshot {
+            focus: "unknown_panel".to_string(),
+            selected_feed: 0,
+            selected_article: 0,
+            scroll_offset: 0,
+        };
+
+        app.restore(snap);
+        assert_eq!(app.focus, Focus::Feeds);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_json_round_trip() {
+        let snap = SessionSnapshot {
+            focus: "articles".to_string(),
+            selected_feed: 2,
+            selected_article: 5,
+            scroll_offset: 10,
+        };
+
+        let json = serde_json::to_string(&snap).unwrap();
+        let restored: SessionSnapshot = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.focus, "articles");
+        assert_eq!(restored.selected_feed, 2);
+        assert_eq!(restored.selected_article, 5);
+        assert_eq!(restored.scroll_offset, 10);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_forward_compatible() {
+        // Simulate a JSON from a future version with extra fields
+        let json = r#"{"focus":"feeds","selected_feed":1,"selected_article":0,"scroll_offset":0,"new_field":"value"}"#;
+        let snap: SessionSnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(snap.focus, "feeds");
+        assert_eq!(snap.selected_feed, 1);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_default_on_empty_json() {
+        let snap: SessionSnapshot = serde_json::from_str("{}").unwrap();
+        assert_eq!(snap.focus, "feeds");
+        assert_eq!(snap.selected_feed, 0);
+        assert_eq!(snap.selected_article, 0);
+        assert_eq!(snap.scroll_offset, 0);
+    }
+
+    // ========================================================================
+    // Theme + Keybinding Integration Tests (TASK-16)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_theme_defaults_to_dark() {
+        let app = test_app().await;
+        assert_eq!(app.theme_variant, ThemeVariant::Dark);
+    }
+
+    #[tokio::test]
+    async fn test_cycle_theme_dark_to_light() {
+        let mut app = test_app().await;
+        let name = app.cycle_theme();
+        assert_eq!(name, "Light");
+        assert_eq!(app.theme_variant, ThemeVariant::Light);
+        assert!(app.needs_redraw);
+    }
+
+    #[tokio::test]
+    async fn test_cycle_theme_light_to_dark() {
+        let mut app = test_app().await;
+        app.cycle_theme(); // Dark -> Light
+        app.needs_redraw = false; // Reset
+        let name = app.cycle_theme(); // Light -> Dark
+        assert_eq!(name, "Dark");
+        assert_eq!(app.theme_variant, ThemeVariant::Dark);
+        assert!(app.needs_redraw);
+    }
+
+    #[tokio::test]
+    async fn test_cycle_theme_full_round_trip() {
+        let mut app = test_app().await;
+        // Save initial style for a role
+        let initial_selected = app.style("feed_selected");
+
+        // Cycle to Light
+        app.cycle_theme();
+        let light_selected = app.style("feed_selected");
+        assert_ne!(
+            initial_selected, light_selected,
+            "Light should differ from Dark"
+        );
+
+        // Cycle back to Dark
+        app.cycle_theme();
+        let restored_selected = app.style("feed_selected");
+        assert_eq!(
+            initial_selected, restored_selected,
+            "Dark should match original after full cycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_theme_updates_variant_and_styles() {
+        let mut app = test_app().await;
+        let dark_border = app.style("panel_border_focused");
+
+        app.set_theme(ThemeVariant::Light);
+        assert_eq!(app.theme_variant, ThemeVariant::Light);
+
+        let light_border = app.style("panel_border_focused");
+        assert_ne!(dark_border, light_border);
+    }
+
+    #[tokio::test]
+    async fn test_theme_style_resolves_all_roles() {
+        let app = test_app().await;
+        // Verify all 26 semantic roles resolve to non-default (most should)
+        let roles = [
+            "feed_selected",
+            "feed_unread",
+            "feed_error",
+            "article_selected",
+            "article_star",
+            "article_feed_prefix",
+            "reader_heading",
+            "reader_code_block",
+            "reader_inline_code",
+            "reader_error",
+            "reader_fallback",
+            "reader_image",
+            "status_bar",
+            "panel_border_focused",
+            "whatsnew_border_focused",
+            "whatsnew_selected",
+        ];
+        for role in roles {
+            let style = app.style(role);
+            assert_ne!(
+                style,
+                Style::default(),
+                "Role '{}' should not be default style",
+                role
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_keybinding_registry_has_cycle_theme() {
+        use crate::keybindings::{Action as KbAction, Context as KbContext};
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let app = test_app().await;
+        let action = app.keybindings.action_for_key(
+            KeyCode::Char('T'),
+            KeyModifiers::NONE,
+            KbContext::Global,
+        );
+        assert_eq!(action, Some(KbAction::CycleTheme));
+    }
+
+    #[tokio::test]
+    async fn test_theme_unknown_role_returns_default() {
+        let app = test_app().await;
+        assert_eq!(app.style("nonexistent_role"), Style::default());
+    }
+
+    #[tokio::test]
+    async fn test_config_keybinding_overrides_applied_to_app() {
+        use crate::keybindings::{Action as KbAction, Context as KbContext};
+        use crossterm::event::{KeyCode, KeyModifiers};
+        use std::collections::HashMap;
+
+        let mut app = test_app().await;
+
+        // Default: 'q' = Quit
+        assert_eq!(
+            app.keybindings.action_for_key(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+                KbContext::Global
+            ),
+            Some(KbAction::Quit)
+        );
+
+        // Override quit to Ctrl+q
+        let mut overrides = HashMap::new();
+        overrides.insert("quit".to_string(), "Ctrl+q".to_string());
+        let warnings = app.keybindings.apply_overrides(&overrides);
+        assert!(warnings.is_empty());
+
+        // Old binding gone, new binding active
+        assert_eq!(
+            app.keybindings.action_for_key(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+                KbContext::Global
+            ),
+            None
+        );
+        assert_eq!(
+            app.keybindings.action_for_key(
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+                KbContext::Global
+            ),
+            Some(KbAction::Quit)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_config_theme_variant_from_str() {
+        // Verify config theme strings map to correct ThemeVariant
+        assert_eq!(
+            ThemeVariant::from_str_name("dark"),
+            Some(ThemeVariant::Dark)
+        );
+        assert_eq!(
+            ThemeVariant::from_str_name("light"),
+            Some(ThemeVariant::Light)
+        );
+        assert_eq!(
+            ThemeVariant::from_str_name("DARK"),
+            Some(ThemeVariant::Dark)
+        );
+        assert_eq!(ThemeVariant::from_str_name("neon"), None);
+    }
+
+    #[tokio::test]
+    async fn test_keybinding_override_preserves_theme_cycling() {
+        use crate::keybindings::{Action as KbAction, Context as KbContext};
+        use crossterm::event::{KeyCode, KeyModifiers};
+        use std::collections::HashMap;
+
+        let mut app = test_app().await;
+
+        // Override CycleTheme to F5
+        let mut overrides = HashMap::new();
+        overrides.insert("theme".to_string(), "F5".to_string());
+        app.keybindings.apply_overrides(&overrides);
+
+        // Old key gone
+        assert_eq!(
+            app.keybindings.action_for_key(
+                KeyCode::Char('T'),
+                KeyModifiers::NONE,
+                KbContext::Global
+            ),
+            None
+        );
+
+        // New key works
+        assert_eq!(
+            app.keybindings
+                .action_for_key(KeyCode::F(5), KeyModifiers::NONE, KbContext::Global),
+            Some(KbAction::CycleTheme)
+        );
+
+        // Theme cycling still functions via App method
+        assert_eq!(app.theme_variant, ThemeVariant::Dark);
+        let name = app.cycle_theme();
+        assert_eq!(name, "Light");
+        assert_eq!(app.theme_variant, ThemeVariant::Light);
+    }
+
+    #[tokio::test]
+    async fn test_theme_styles_differ_between_variants() {
+        use ratatui::style::Color;
+
+        let mut app = test_app().await;
+
+        // Dark theme: feed_selected uses DarkGray bg
+        let dark_selected = app.style("feed_selected");
+        assert_eq!(
+            dark_selected,
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        );
+
+        // Switch to Light
+        app.set_theme(ThemeVariant::Light);
+
+        // Light theme: feed_selected uses Blue bg
+        let light_selected = app.style("feed_selected");
+        assert_eq!(
+            light_selected,
+            Style::default().bg(Color::Blue).fg(Color::White)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_show_help_keybinding_exists() {
+        use crate::keybindings::{Action as KbAction, Context as KbContext};
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let app = test_app().await;
+        let action = app.keybindings.action_for_key(
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+            KbContext::Global,
+        );
+        assert_eq!(action, Some(KbAction::ShowHelp));
+    }
+
+    #[tokio::test]
+    async fn test_all_bindings_include_theme_and_help() {
+        let app = test_app().await;
+        let bindings = app.keybindings.all_bindings();
+
+        let has_cycle_theme = bindings
+            .iter()
+            .any(|(_, _, action, _)| *action == crate::keybindings::Action::CycleTheme);
+        let has_show_help = bindings
+            .iter()
+            .any(|(_, _, action, _)| *action == crate::keybindings::Action::ShowHelp);
+
+        assert!(has_cycle_theme, "all_bindings should include CycleTheme");
+        assert!(has_show_help, "all_bindings should include ShowHelp");
+    }
+
+    #[tokio::test]
+    async fn test_theme_set_status_on_cycle() {
+        let mut app = test_app().await;
+        let name = app.cycle_theme();
+        app.set_status(format!("Theme: {}", name));
+
+        assert!(app.status_message.is_some());
+        let (msg, _) = app.status_message.as_ref().unwrap();
+        assert_eq!(msg, "Theme: Light");
     }
 }

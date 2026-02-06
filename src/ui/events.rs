@@ -3,8 +3,9 @@
 //! This module processes background task completion events such as
 //! refresh progress, content loading, and star toggle results.
 
-use crate::app::{App, AppEvent, ContentState, Focus, View};
+use crate::app::{App, AppEvent, ContentState, Focus, View, WhatsNewEntry};
 use crate::storage::Article;
+use crate::util::strip_control_chars;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,12 +20,15 @@ pub(super) const MAX_WHATS_NEW: usize = 100;
 /// Takes a list of (feed_id, article) tuples and interleaves them so no single
 /// feed dominates the list. Articles within each feed maintain their order
 /// (by published date from the query).
+///
+/// PERF-023: Returns lightweight `WhatsNewEntry` instead of full `Article` clones.
 fn round_robin_by_feed(
     articles: Vec<(i64, Article)>,
     feed_title_cache: &HashMap<i64, Arc<str>>,
-) -> Vec<(Arc<str>, Article)> {
+) -> Vec<WhatsNewEntry> {
     // Group articles by feed, preserving order within each feed
-    let mut by_feed: HashMap<i64, Vec<Article>> = HashMap::new();
+    // PERF-024: Pre-allocate assuming ~5 articles per feed to avoid resizes
+    let mut by_feed: HashMap<i64, Vec<Article>> = HashMap::with_capacity(articles.len() / 5);
     for (feed_id, article) in articles {
         by_feed.entry(feed_id).or_default().push(article);
     }
@@ -44,11 +48,16 @@ fn round_robin_by_feed(
                 return false; // Stop early if we hit the limit
             }
             if let Some(article) = articles.pop_front() {
-                let title = feed_title_cache
+                let feed_title = feed_title_cache
                     .get(feed_id)
                     .map(Arc::clone)
                     .unwrap_or_else(|| Arc::from("Unknown"));
-                result.push((title, article));
+                result.push(WhatsNewEntry {
+                    article_id: article.id,
+                    feed_title,
+                    title: Arc::clone(&article.title),
+                    published: article.published,
+                });
             }
             !articles.is_empty() // Retain only feeds with remaining articles
         });
@@ -115,6 +124,22 @@ pub(super) async fn handle_app_event(app: &mut App, event: AppEvent) {
         } => {
             handle_search_completed(app, query, generation, results);
         }
+        AppEvent::BulkMarkReadComplete { feed_id, count } => {
+            handle_bulk_mark_read_complete(app, feed_id, count);
+        }
+        AppEvent::BulkMarkReadFailed { feed_id, error } => {
+            handle_bulk_mark_read_failed(app, feed_id, error);
+        }
+        AppEvent::ExportComplete { count, path } => {
+            tracing::info!(count, path = %path, "OPML export complete");
+            app.set_status(format!("Exported {} feeds to {}", count, path));
+            app.needs_redraw = true;
+        }
+        AppEvent::ExportFailed { error } => {
+            tracing::error!(error = %error, "OPML export failed");
+            app.set_status(format!("Export failed: {}", error));
+            app.needs_redraw = true;
+        }
     }
 }
 
@@ -155,8 +180,11 @@ fn handle_search_completed(
 async fn handle_refresh_complete(app: &mut App, results: Vec<crate::app::FetchResult>) {
     app.refresh_progress = None;
 
-    // Filter out results for deleted feeds to avoid wasted work.
-    // If a feed was deleted during refresh, its results are orphaned.
+    // BUG-025: Filter out results for feeds deleted during refresh.
+    // This IS reachable: feeds are Arc-cloned before refresh starts, but the user
+    // can delete a feed from the UI while the refresh task is in-flight. When that
+    // happens, the refresh returns results for a feed_id no longer in app.feeds.
+    // Without this filter, we'd attempt to display orphaned articles.
     use std::collections::HashSet;
     let current_feed_ids: HashSet<i64> = app.feeds.iter().map(|f| f.id).collect();
     let results: Vec<_> = results
@@ -235,6 +263,8 @@ async fn handle_refresh_complete(app: &mut App, results: Vec<crate::app::FetchRe
     // Reload feeds with updated counts
     if let Ok(feeds) = app.db.get_feeds_with_unread_counts().await {
         app.feeds = Arc::new(feeds);
+        // BUG-004: Clamp immediately after feed list mutation to prevent out-of-bounds access
+        app.clamp_selections();
 
         // BUG-011: Sync feed cache to remove stale entries from deleted feeds
         // This also updates all current feed entries
@@ -361,13 +391,17 @@ fn handle_content_loaded(
 
             match result {
                 Ok(content) => {
+                    // SEC-001: Sanitize content from jina.ai before rendering
+                    let content = strip_control_chars(&content).into_owned();
                     // PERF-004: Parse markdown once and cache rendered lines
-                    let rendered_lines = render_markdown(&content);
+                    let rendered_lines = render_markdown(&content, &app.theme);
                     app.content_state = ContentState::Loaded {
                         article_id,
                         content,
                         rendered_lines,
                     };
+                    // PERF-022: Clear negative cache on success
+                    app.failed_content_cache.remove(&article_id);
                 }
                 Err(e) => {
                     let fallback = reader_article.summary.clone();
@@ -376,8 +410,13 @@ fn handle_content_loaded(
                         error: e.to_string(),
                         fallback,
                     };
+                    // PERF-022: Insert into negative cache on failure
+                    app.failed_content_cache
+                        .insert(article_id, tokio::time::Instant::now());
                 }
             }
+            // PERF-020: Invalidate cached line count when content state changes
+            app.reader_cached_line_count = None;
         } else {
             // BUG-001 fix: Clear loading flag for stale content
             // The generation counter handles race conditions, so we can safely
@@ -407,16 +446,16 @@ fn handle_star_toggled(app: &mut App, article_id: i64, starred: bool) {
             }
         }
     }
+    // SAFETY: All Arc::make_mut calls on app.articles must happen on the event loop
+    // thread (never in spawned tasks). Background tasks may hold Arc clones for reading
+    // but must never mutate. This ensures sequential access without locks.
     // PERF-015: Use Arc::make_mut for copy-on-write optimization
     // Only clones the Vec if there are other references, otherwise mutates in place
     let articles = Arc::make_mut(&mut app.articles);
     if let Some(article) = articles.iter_mut().find(|a| a.id == article_id) {
         article.starred = starred;
     }
-    // Update in whats_new by ID
-    if let Some((_, article)) = app.whats_new.iter_mut().find(|(_, a)| a.id == article_id) {
-        article.starred = starred;
-    }
+    // PERF-023: WhatsNewEntry is display-only; no starred/read fields to update
     // Invalidate cache if it exists (defense in depth)
     if app.cached_articles.is_some() {
         tracing::debug!(
@@ -425,6 +464,7 @@ fn handle_star_toggled(app: &mut App, article_id: i64, starred: bool) {
         );
         app.cached_articles = None;
     }
+    app.needs_redraw = true;
 }
 
 /// Handle star toggle failure event with rollback.
@@ -445,13 +485,7 @@ fn handle_star_toggle_failed(app: &mut App, article_id: i64, original_status: bo
         found = true;
     }
 
-    // Also rollback in whats_new if present
-    for (_, article) in app.whats_new.iter_mut() {
-        if article.id == article_id {
-            article.starred = original_status;
-            found = true;
-        }
-    }
+    // PERF-023: WhatsNewEntry is display-only; no starred field to rollback
 
     // Also rollback in reader_article if viewing
     if let Some(ref mut reader_article) = app.reader_article {
@@ -477,5 +511,40 @@ fn handle_star_toggle_failed(app: &mut App, article_id: i64, original_status: bo
         app.set_status("Failed to save star status");
     }
 
+    app.needs_redraw = true;
+}
+
+/// Handle bulk mark-read completion event.
+///
+/// Updates feed unread counts without reloading articles from DB.
+/// The optimistic UI update on articles happens in the input handler (TASK-5).
+fn handle_bulk_mark_read_complete(app: &mut App, feed_id: Option<i64>, count: u64) {
+    match feed_id {
+        Some(fid) => {
+            // Decrement the specific feed's unread_count
+            let feeds = Arc::make_mut(&mut app.feeds);
+            if let Some(feed) = feeds.iter_mut().find(|f| f.id == fid) {
+                feed.unread_count = feed.unread_count.saturating_sub(count as i64);
+            }
+            tracing::info!(feed_id = fid, count, "Marked articles read for feed");
+        }
+        None => {
+            // All feeds: set every feed's unread_count to 0
+            let feeds = Arc::make_mut(&mut app.feeds);
+            for feed in feeds.iter_mut() {
+                feed.unread_count = 0;
+            }
+            tracing::info!(count, "Marked all articles read across all feeds");
+        }
+    }
+    app.clamp_selections();
+    app.needs_redraw = true;
+    app.set_status(format!("Marked {} articles read", count));
+}
+
+/// Handle bulk mark-read failure event.
+fn handle_bulk_mark_read_failed(app: &mut App, feed_id: Option<i64>, error: String) {
+    tracing::error!(feed_id = ?feed_id, error = %error, "Bulk mark-read failed");
+    app.set_status(format!("Failed to mark articles read: {}", error));
     app.needs_redraw = true;
 }
