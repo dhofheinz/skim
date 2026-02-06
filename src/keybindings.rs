@@ -372,9 +372,9 @@ impl KeybindingRegistry {
             Action::ContextMenu,
         );
 
-        // Prefetch articles for offline reading (feed list context)
+        // Prefetch articles for offline reading (global — operates on selected feed)
         self.bind(
-            Context::FeedList,
+            Context::Global,
             KeySpec::plain(KeyCode::Char('P')),
             Action::Prefetch,
         );
