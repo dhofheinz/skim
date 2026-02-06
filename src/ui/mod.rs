@@ -23,6 +23,7 @@
 mod articles;
 mod events;
 mod feeds;
+mod help;
 mod helpers;
 mod input;
 mod loop_runner;
