@@ -73,6 +73,23 @@ pub struct FtsConsistencyReport {
 }
 
 // ============================================================================
+// Category Types
+// ============================================================================
+
+/// A feed category for grouping feeds into a tree hierarchy.
+///
+/// Supports nesting via `parent_id` (max depth 3).
+/// The UI builds the tree from a flat list ordered by `sort_order`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Consumed by downstream tasks (TASK-5, TASK-8)
+pub struct FeedCategory {
+    pub id: i64,
+    pub name: String,
+    pub parent_id: Option<i64>,
+    pub sort_order: i64,
+}
+
+// ============================================================================
 // Helper Types
 // ============================================================================
 
@@ -85,7 +102,8 @@ pub(crate) type FeedRow = (
     Option<i64>,
     Option<String>,
     i64,
-    i64, // consecutive_failures
+    i64,         // consecutive_failures
+    Option<i64>, // category_id
 );
 
 /// Represents a feed imported from OPML
@@ -201,6 +219,10 @@ pub struct Feed {
     pub unread_count: i64,
     /// Number of consecutive fetch failures (circuit breaker)
     pub consecutive_failures: i64,
+    /// Category this feed belongs to, or None for uncategorized.
+    /// Read by TASK-8 (category sidebar filter) via `filtered_feeds()`.
+    #[allow(dead_code)]
+    pub category_id: Option<i64>,
 }
 
 /// Article data from database

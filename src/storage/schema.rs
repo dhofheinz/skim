@@ -292,6 +292,26 @@ impl Database {
             .await
             .ok(); // Ignore error if column already exists
 
+        // Create feed_categories table for grouping feeds into a tree hierarchy
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS feed_categories (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                parent_id INTEGER REFERENCES feed_categories(id) ON DELETE SET NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0
+            )
+        "#,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // Add category_id column to feeds (nullable FK to feed_categories)
+        sqlx::query("ALTER TABLE feeds ADD COLUMN category_id INTEGER REFERENCES feed_categories(id) ON DELETE SET NULL")
+            .execute(&mut *tx)
+            .await
+            .ok(); // Ignore error if column already exists
+
         // Create user preferences table (key-value store for user settings)
         // Keys use dotted convention: theme.variant, keybind.quit, session.view, etc.
         sqlx::query(
