@@ -26,9 +26,13 @@
 //! let results = refresh_all(db, client, feeds, progress_tx).await;
 //! ```
 
+mod discovery;
 mod fetcher;
 mod opml;
 mod parser;
 
+#[allow(unused_imports)] // Re-exported for downstream consumers (TASK-10 integration tests)
+pub use discovery::DiscoveryError;
+pub use discovery::{discover_feed, DiscoveredFeed};
 pub use fetcher::{refresh_all, refresh_one};
-pub use opml::{export_to_file, parse, OpmlFeed};
+pub use opml::{export_to_file, export_to_file_with_categories, parse, OpmlFeed};
