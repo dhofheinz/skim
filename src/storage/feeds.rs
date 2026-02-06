@@ -50,7 +50,8 @@ impl Database {
                 SELECT
                     f.id, f.title, f.url, f.html_url, f.last_fetched, f.error,
                     COUNT(CASE WHEN a.read = 0 THEN 1 END) as unread_count,
-                    f.consecutive_failures
+                    f.consecutive_failures,
+                    f.category_id
                 FROM feeds f
                 LEFT JOIN articles a ON f.id = a.feed_id
                 GROUP BY f.id
@@ -73,6 +74,7 @@ impl Database {
                     error,
                     unread_count,
                     consecutive_failures,
+                    category_id,
                 )| Feed {
                     id,
                     title: Arc::from(strip_control_chars(&title)),
@@ -82,11 +84,44 @@ impl Database {
                     error,
                     unread_count,
                     consecutive_failures,
+                    category_id,
                 },
             )
             .collect();
 
         Ok(feeds)
+    }
+
+    /// Insert a single feed by URL, or update title/html_url if already exists.
+    ///
+    /// Returns the feed's database ID (either newly inserted or existing).
+    /// Used by the subscribe dialog for single-feed subscription.
+    pub async fn insert_feed(&self, url: &str, title: &str, html_url: Option<&str>) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as(
+            r#"
+            INSERT INTO feeds (title, url, html_url)
+            VALUES (?, ?, ?)
+            ON CONFLICT(url) DO UPDATE SET title = excluded.title, html_url = excluded.html_url
+            RETURNING id
+            "#,
+        )
+        .bind(title)
+        .bind(url)
+        .bind(html_url)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.0)
+    }
+
+    /// Rename a feed by updating its title.
+    pub async fn rename_feed(&self, feed_id: i64, new_title: &str) -> Result<()> {
+        sqlx::query("UPDATE feeds SET title = ? WHERE id = ?")
+            .bind(new_title)
+            .bind(feed_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Set or clear the error status for a feed
@@ -155,6 +190,36 @@ impl Database {
         Ok(())
     }
 
+    /// Delete a feed and all associated data (articles, FTS entries) in a single transaction.
+    ///
+    /// Deleting articles fires the `articles_fts_delete` trigger, which handles FTS5
+    /// external content cleanup automatically via the delete protocol.
+    ///
+    /// Returns the number of deleted articles. Idempotent: deleting a nonexistent feed returns Ok(0).
+    #[allow(dead_code)] // Wired in by TASK-6 (delete feed dialog)
+    pub async fn delete_feed(&self, feed_id: i64) -> Result<usize> {
+        let mut tx = self.pool.begin().await?;
+
+        // Step 1: Delete articles (the articles_fts_delete trigger handles FTS cleanup
+        // automatically for each deleted row via the external content delete protocol)
+        sqlx::query("DELETE FROM articles WHERE feed_id = ?")
+            .bind(feed_id)
+            .execute(&mut *tx)
+            .await?;
+        let (articles_deleted,): (i64,) = sqlx::query_as("SELECT changes()")
+            .fetch_one(&mut *tx)
+            .await?;
+
+        // Step 2: Delete the feed itself
+        sqlx::query("DELETE FROM feeds WHERE id = ?")
+            .bind(feed_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(articles_deleted as usize)
+    }
+
     /// Get all feeds formatted for OPML export, ordered alphabetically by title.
     pub async fn get_feeds_for_export(&self) -> Result<Vec<OpmlFeed>> {
         let rows: Vec<(String, String, Option<String>)> =
@@ -220,7 +285,8 @@ impl Database {
                 SELECT
                     f.id, f.title, f.url, f.html_url, f.last_fetched, f.error,
                     COUNT(CASE WHEN a.read = 0 THEN 1 END) as unread_count,
-                    f.consecutive_failures
+                    f.consecutive_failures,
+                    f.category_id
                 FROM feeds f
                 LEFT JOIN articles a ON f.id = a.feed_id
                 WHERE f.consecutive_failures < ?
@@ -245,6 +311,7 @@ impl Database {
                     error,
                     unread_count,
                     consecutive_failures,
+                    category_id,
                 )| Feed {
                     id,
                     title: Arc::from(strip_control_chars(&title)),
@@ -254,6 +321,7 @@ impl Database {
                     error,
                     unread_count,
                     consecutive_failures,
+                    category_id,
                 },
             )
             .collect();
@@ -769,5 +837,118 @@ mod tests {
             5,
             "Circuit breaker threshold should be 5"
         );
+    }
+
+    // ========================================================================
+    // Delete Feed Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_delete_feed_cascades() {
+        let db = test_db().await;
+        db.sync_feeds(&[test_feed(1), test_feed(2)]).await.unwrap();
+        let feeds = db.get_feeds_with_unread_counts().await.unwrap();
+        let feed1_id = feeds[0].id;
+        let feed2_id = feeds[1].id;
+
+        // Add articles to both feeds
+        db.complete_feed_refresh(
+            feed1_id,
+            &[
+                test_article("a1", "Article 1"),
+                test_article("a2", "Article 2"),
+                test_article("a3", "Article 3"),
+            ],
+        )
+        .await
+        .unwrap();
+        db.complete_feed_refresh(feed2_id, &[test_article("b1", "Article B1")])
+            .await
+            .unwrap();
+
+        // Delete feed 1
+        let deleted = db.delete_feed(feed1_id).await.unwrap();
+        assert_eq!(deleted, 3, "Should report 3 deleted articles");
+
+        // Feed 1 should be gone
+        let feeds = db.get_feeds_with_unread_counts().await.unwrap();
+        assert_eq!(feeds.len(), 1);
+        assert_eq!(feeds[0].id, feed2_id, "Only feed 2 should remain");
+
+        // Feed 1's articles should be gone
+        let articles = db.get_articles_for_feed(feed1_id, None).await.unwrap();
+        assert!(articles.is_empty(), "Feed 1 articles should be deleted");
+
+        // Feed 2's articles should be untouched
+        let articles = db.get_articles_for_feed(feed2_id, None).await.unwrap();
+        assert_eq!(articles.len(), 1, "Feed 2 articles should be untouched");
+    }
+
+    #[tokio::test]
+    async fn test_delete_nonexistent_feed() {
+        let db = test_db().await;
+        let deleted = db.delete_feed(99999).await.unwrap();
+        assert_eq!(deleted, 0, "Deleting nonexistent feed should return 0");
+    }
+
+    #[tokio::test]
+    async fn test_delete_feed_cleans_fts() {
+        let db = test_db().await;
+        db.sync_feeds(&[test_feed(1)]).await.unwrap();
+        let feeds = db.get_feeds_with_unread_counts().await.unwrap();
+        let feed_id = feeds[0].id;
+
+        db.complete_feed_refresh(
+            feed_id,
+            &[test_article("fts-1", "Unique Searchable Content")],
+        )
+        .await
+        .unwrap();
+
+        // Verify FTS entry exists before deletion
+        let results = db
+            .search_articles("Unique Searchable Content")
+            .await
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "FTS should find the article before delete"
+        );
+
+        // Delete the feed
+        db.delete_feed(feed_id).await.unwrap();
+
+        // FTS should return no results
+        let results = db
+            .search_articles("Unique Searchable Content")
+            .await
+            .unwrap();
+        assert!(results.is_empty(), "FTS entries should be cleaned up");
+    }
+
+    // ========================================================================
+    // Rename Feed Tests (TASK-9)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_rename_feed_db() {
+        let db = test_db().await;
+        db.sync_feeds(&[test_feed(1)]).await.unwrap();
+        let feeds = db.get_feeds_with_unread_counts().await.unwrap();
+        let feed_id = feeds[0].id;
+        assert_eq!(&*feeds[0].title, "Test Feed 1");
+
+        db.rename_feed(feed_id, "New Title").await.unwrap();
+
+        let feeds = db.get_feeds_with_unread_counts().await.unwrap();
+        assert_eq!(&*feeds[0].title, "New Title");
+    }
+
+    #[tokio::test]
+    async fn test_rename_nonexistent_feed() {
+        let db = test_db().await;
+        // Renaming a nonexistent feed succeeds (no rows affected, no error)
+        db.rename_feed(99999, "New Title").await.unwrap();
     }
 }
