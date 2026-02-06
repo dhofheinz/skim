@@ -287,6 +287,8 @@ async fn handle_browse_input(
                     app.http_client.clone(),
                     event_tx.clone(),
                 );
+            } else {
+                app.set_status("No feed selected");
             }
         }
         _ => {}
