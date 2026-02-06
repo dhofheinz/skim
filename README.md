@@ -9,10 +9,14 @@ A terminal RSS reader that fetches clean article content via jina.ai for distrac
 
 - **Fast TUI** - Keyboard-driven interface built with ratatui
 - **Clean content** - Article extraction via jina.ai Reader API
+- **Subscribe by URL** - Discover and add feeds from any URL or HTML page
+- **Feed management** - Delete, rename, and organize feeds via context menu
+- **Categories** - Collapsible tree sidebar for grouping feeds into folders
 - **Offline-first** - Sync once, read without network
 - **Concurrent refresh** - Fetches 10 feeds simultaneously
 - **Markdown rendering** - Styled headings, code blocks, emphasis
 - **Search** - Global search across all feeds
+- **OPML import/export** - Round-trip with category nesting preserved
 - **Persistent state** - Read/starred status saved in SQLite
 
 ## Installation
@@ -30,7 +34,7 @@ cargo build --release
 
 ## Getting Started
 
-Import your OPML file:
+Import an OPML file or subscribe to individual feeds:
 
 ```bash
 skim --import /path/to/feeds.opml
@@ -42,6 +46,8 @@ Then just run:
 skim
 ```
 
+Press `+` to subscribe to a feed by URL, or `m` on any feed for rename, move, delete, and more.
+
 ## Keybindings
 
 ### Browse View
@@ -51,14 +57,30 @@ skim
 | `j` / `↓` | Navigate down |
 | `k` / `↑` | Navigate up |
 | `Enter` | Select feed / Open article |
-| `Tab` | Cycle focus (Feeds → Articles → What's New) |
+| `Tab` | Cycle focus (Categories → Feeds → Articles) |
 | `r` | Refresh all feeds |
 | `R` | Refresh selected feed |
 | `s` | Toggle star |
 | `o` | Open in browser |
 | `/` | Search |
+| `+` | Subscribe to feed by URL |
+| `d` | Delete selected feed |
+| `m` | Feed context menu (rename, move, delete, refresh, open) |
+| `c` | Toggle category sidebar |
+| `e` | Export feeds to OPML |
+| `?` | Show help overlay |
 | `Esc` | Dismiss What's New panel |
 | `q` | Quit |
+
+### Categories
+
+| Key | Action |
+|-----|--------|
+| `j` / `↓` | Navigate categories |
+| `k` / `↑` | Navigate categories |
+| `Enter` | Filter feeds by selected category |
+| `h` / `←` | Collapse category |
+| `l` / `→` | Expand category |
 
 ### Reader View
 
@@ -87,7 +109,8 @@ Config directory: `~/.config/skim/`
 | File | Purpose |
 |------|---------|
 | `feeds.opml` | Your feed subscriptions |
-| `rss.db` | SQLite database (articles, read state) |
+| `rss.db` | SQLite database (articles, categories, read state) |
+| `config.toml` | Theme, keybindings, and preferences |
 
 ### Environment Variables
 
