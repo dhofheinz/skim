@@ -10,6 +10,7 @@ use anyhow::Result;
 use futures::FutureExt;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Error message for articles without URLs
@@ -232,48 +233,6 @@ pub(super) async fn exit_search_mode(app: &mut App) -> Result<()> {
     Ok(())
 }
 
-/// Validates a URL before passing to open::that() to prevent command injection.
-///
-/// # Security
-///
-/// This function guards against:
-/// - Non-HTTP(S) schemes (e.g., `file://`, `javascript:`, custom schemes)
-/// - Control characters (ASCII 0-31, DEL) that could manipulate shell behavior
-/// - Dangerous shell metacharacters (backtick, $, ;, |, <, >, etc.) that could enable command injection
-/// - Malformed URLs that could be interpreted as shell commands
-///
-/// Note: Valid URL characters like `&`, `?`, `=`, `#` are allowed since they're common in query strings.
-///
-/// # Returns
-///
-/// - `Ok(())` if the URL is safe to open
-/// - `Err(&'static str)` with a user-friendly error message otherwise
-pub(super) fn validate_url_for_open(url_str: &str) -> Result<(), &'static str> {
-    use url::Url;
-
-    // Check for control characters (ASCII 0-31 and DEL 127)
-    if url_str.bytes().any(|b| b < 32 || b == 127) {
-        return Err("URL contains invalid control characters");
-    }
-
-    // Ensure URL uses http or https scheme
-    if !url_str.starts_with("http://") && !url_str.starts_with("https://") {
-        return Err("URL must use http or https scheme");
-    }
-
-    // Reject particularly dangerous shell metacharacters
-    // Note: & is valid in query strings, so we only block the most dangerous ones
-    const DANGEROUS_CHARS: &[char] = &['`', '$', ';', '|', '<', '>', '(', ')', '{', '}'];
-    if url_str.chars().any(|c| DANGEROUS_CHARS.contains(&c)) {
-        return Err("URL contains potentially unsafe characters");
-    }
-
-    // Parse with url crate for additional format validation
-    Url::parse(url_str).map_err(|_| "Invalid URL format")?;
-
-    Ok(())
-}
-
 /// Attempt to spawn content load for an article.
 ///
 /// Handles all pre-spawn checks and state updates:
@@ -293,12 +252,33 @@ pub(super) fn validate_url_for_open(url_str: &str) -> Result<(), &'static str> {
 ///
 /// Returns `true` if a content load was spawned, `false` if skipped (already loading
 /// or article has no URL).
+/// TTL for negative content cache entries (5 minutes).
+const FAILED_CONTENT_TTL: Duration = Duration::from_secs(300);
+
 pub(super) fn try_spawn_content_load(
     app: &mut App,
     article: &Article,
     event_tx: &mpsc::Sender<AppEvent>,
 ) -> bool {
     let article_id = article.id;
+
+    // PERF-022: Check negative cache for recent failures
+    if let Some(failed_at) = app.failed_content_cache.get(&article_id) {
+        if failed_at.elapsed() < FAILED_CONTENT_TTL {
+            let remaining = FAILED_CONTENT_TTL - failed_at.elapsed();
+            let mins = remaining.as_secs() / 60;
+            let secs = remaining.as_secs() % 60;
+            app.content_state = ContentState::Failed {
+                article_id,
+                error: format!("Content unavailable (retry in {}m {}s)", mins, secs),
+                fallback: article.summary.clone(),
+            };
+            tracing::debug!(article_id, mins, secs, "Negative cache hit, skipping fetch");
+            return false;
+        }
+        // TTL expired, remove from cache and allow retry
+        app.failed_content_cache.remove(&article_id);
+    }
 
     // Check if already loading content for a different article
     if app.content_loading_for.is_some() && app.content_loading_for != Some(article_id) {
@@ -310,10 +290,15 @@ pub(super) fn try_spawn_content_load(
         app.content_loading_for = None;
     }
 
-    // Guard: skip if already loading for this article
-    if app.content_loading_for.is_some() {
-        tracing::debug!(article_id, "Content load already in progress, skipping");
-        return false;
+    // Guard: skip if actively loading for this article
+    if app.content_loading_for == Some(article_id) {
+        if matches!(app.content_state, ContentState::Loading { .. }) {
+            tracing::debug!(article_id, "Content load already in progress, skipping");
+            return false;
+        }
+        // BUG-016: Stale content_loading_for from previous reader session — clear and proceed
+        tracing::debug!(article_id, "Clearing stale content_loading_for flag");
+        app.content_loading_for = None;
     }
 
     // Handle no-URL case with fallback to summary

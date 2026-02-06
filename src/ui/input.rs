@@ -5,6 +5,7 @@
 
 use crate::app::{App, AppEvent, CachedArticleState, ContentState, FetchResult, Focus, View};
 use crate::feed::{refresh_all, refresh_one};
+use crate::keybindings::{Action as KbAction, Context as KbContext};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::sync::Arc;
@@ -13,12 +14,19 @@ use tokio::sync::mpsc;
 
 use super::helpers::{
     catch_task_panic, exit_search_mode, exit_starred_mode, restore_articles_from_search,
-    try_spawn_content_load, validate_url_for_open, ERR_ARTICLE_NO_URL,
+    try_spawn_content_load, ERR_ARTICLE_NO_URL,
 };
 use super::Action;
+use crate::util::{validate_url_for_open, MAX_SEARCH_QUERY_LENGTH};
 
-/// Maximum allowed search query length (UI layer validation)
-const MAX_SEARCH_LENGTH: usize = 256;
+/// Map the current focus panel to a keybinding context for context-specific lookups.
+fn focus_to_context(focus: Focus) -> KbContext {
+    match focus {
+        Focus::Feeds => KbContext::FeedList,
+        Focus::Articles => KbContext::ArticleList,
+        Focus::WhatsNew => KbContext::WhatsNew,
+    }
+}
 
 /// Main input dispatch function.
 ///
@@ -29,6 +37,11 @@ pub(super) async fn handle_input(
     modifiers: KeyModifiers,
     event_tx: &mpsc::Sender<AppEvent>,
 ) -> Result<Action> {
+    // Handle help overlay input first (captures all keys when visible)
+    if app.show_help {
+        return Ok(handle_help_input(app, code));
+    }
+
     // Handle search mode input separately
     if app.search_mode {
         return handle_search_input(app, code).await;
@@ -40,16 +53,39 @@ pub(super) async fn handle_input(
     }
 }
 
+/// Handle input while the help overlay is visible.
+///
+/// Captures all keys: j/k/Up/Down scroll, Esc/q/? dismiss.
+fn handle_help_input(app: &mut App, code: KeyCode) -> Action {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+            app.show_help = false;
+            app.help_scroll_offset = 0;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.help_scroll_offset = app.help_scroll_offset.saturating_add(1);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.help_scroll_offset = app.help_scroll_offset.saturating_sub(1);
+        }
+        _ => {}
+    }
+    Action::Continue
+}
+
 /// Handle input in browse view (feeds + articles panels).
 async fn handle_browse_input(
     app: &mut App,
     code: KeyCode,
-    _modifiers: KeyModifiers,
+    modifiers: KeyModifiers,
     event_tx: &mpsc::Sender<AppEvent>,
 ) -> Result<Action> {
-    match code {
-        KeyCode::Char('q') => return Ok(Action::Quit),
-        KeyCode::Esc => {
+    let context = focus_to_context(app.focus);
+    let action = app.keybindings.action_for_key(code, modifiers, context);
+
+    match action {
+        Some(KbAction::Quit) => return Ok(Action::Quit),
+        Some(KbAction::Back) => {
             // Priority: Dismiss What's New panel first, then exit starred mode
             if app.show_whats_new {
                 app.dismiss_whats_new();
@@ -57,9 +93,9 @@ async fn handle_browse_input(
                 exit_starred_mode(app, "ESC").await?;
             }
         }
-        KeyCode::Char('j') | KeyCode::Down => app.nav_down(),
-        KeyCode::Char('k') | KeyCode::Up => app.nav_up(),
-        KeyCode::Tab => {
+        Some(KbAction::NavDown) => app.nav_down(),
+        Some(KbAction::NavUp) => app.nav_up(),
+        Some(KbAction::CycleFocus) => {
             app.focus = if app.show_whats_new {
                 match app.focus {
                     Focus::WhatsNew => Focus::Feeds,
@@ -74,19 +110,19 @@ async fn handle_browse_input(
                 }
             };
         }
-        KeyCode::Enter => {
+        Some(KbAction::Select) => {
             handle_enter_key(app, event_tx).await?;
         }
-        KeyCode::Char('r') => {
+        Some(KbAction::RefreshAll) => {
             handle_refresh_all(app, event_tx).await;
         }
-        KeyCode::Char('R') => {
+        Some(KbAction::RefreshOne) => {
             handle_refresh_one(app, event_tx).await;
         }
-        KeyCode::Char('s') => {
+        Some(KbAction::ToggleStar) => {
             handle_star_toggle_browse(app, event_tx).await;
         }
-        KeyCode::Char('o') => {
+        Some(KbAction::OpenInBrowser) => {
             if let Some(article) = app.selected_article() {
                 if let Some(url) = &article.url {
                     // SEC: Validate URL before open::that() to prevent command injection
@@ -100,7 +136,7 @@ async fn handle_browse_input(
                 }
             }
         }
-        KeyCode::Char('O') => {
+        Some(KbAction::OpenFeedSite) => {
             // Open feed website (html_url from OPML)
             if let Some(feed) = app.selected_feed() {
                 if let Some(url) = &feed.html_url {
@@ -117,7 +153,7 @@ async fn handle_browse_input(
                 }
             }
         }
-        KeyCode::Char('/') => {
+        Some(KbAction::EnterSearch) => {
             // PERF-008: Cache current state before entering search mode
             // Arc::clone is O(1) - just increments reference count
             app.cached_articles = Some(CachedArticleState {
@@ -129,8 +165,25 @@ async fn handle_browse_input(
             app.search_input.clear();
             app.search_feed_id = app.selected_feed().map(|f| f.id);
         }
-        KeyCode::Char('S') => {
+        Some(KbAction::ToggleStarredMode) => {
             handle_starred_mode_toggle(app).await?;
+        }
+        Some(KbAction::MarkFeedRead) => {
+            handle_mark_feed_read(app, event_tx).await;
+        }
+        Some(KbAction::MarkAllRead) => {
+            handle_mark_all_read(app, event_tx).await;
+        }
+        Some(KbAction::ExportOpml) => {
+            handle_export_opml(app, event_tx);
+        }
+        Some(KbAction::CycleTheme) => {
+            let name = app.cycle_theme();
+            app.set_status(format!("Theme: {}", name));
+        }
+        Some(KbAction::ShowHelp) => {
+            app.show_help = true;
+            app.help_scroll_offset = 0;
         }
         _ => {}
     }
@@ -140,30 +193,16 @@ async fn handle_browse_input(
 /// Handle Enter key press in browse view.
 async fn handle_enter_key(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) -> Result<()> {
     if app.focus == Focus::WhatsNew {
-        // Open article from What's New panel - use get() directly for safety
-        match app.whats_new.get(app.whats_new_selected).cloned() {
-            Some((_, article)) => {
-                let article_id = article.id;
+        // PERF-023: Fetch full Article from DB for reader entry
+        let entry = app.whats_new.get(app.whats_new_selected).or_else(|| {
+            // Stale selection index — fallback to first entry
+            app.whats_new.first()
+        });
 
-                // Set up reader view
-                app.view = View::Reader;
-                app.scroll_offset = 0;
-                app.content_state = ContentState::Loading { article_id };
-                app.reader_article = Some(article.clone());
-                app.db.mark_article_read(article_id).await?;
-
-                // Spawn content loading task
-                try_spawn_content_load(app, &article, event_tx);
-            }
-            None => {
-                // Either empty list or stale selection index - reset and handle
-                app.whats_new_selected = 0;
-                if app.whats_new.is_empty() {
-                    app.set_status("No new articles");
-                } else if let Some((_, article)) = app.whats_new.first().cloned() {
-                    // Retry with index 0 after reset
-                    let article_id = article.id;
-
+        if let Some(entry) = entry {
+            let article_id = entry.article_id;
+            match app.db.get_article_by_id(article_id).await? {
+                Some(article) => {
                     app.view = View::Reader;
                     app.scroll_offset = 0;
                     app.content_state = ContentState::Loading { article_id };
@@ -172,7 +211,12 @@ async fn handle_enter_key(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) -> R
 
                     try_spawn_content_load(app, &article, event_tx);
                 }
+                None => {
+                    app.set_status("Article no longer exists");
+                }
             }
+        } else {
+            app.set_status("No new articles");
         }
     } else if app.focus == Focus::Feeds {
         // Load articles for selected feed
@@ -180,6 +224,10 @@ async fn handle_enter_key(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) -> R
             let feed_id = feed.id;
             // PERF-008: Invalidate cache when feed selection changes
             app.cached_articles = None;
+            // BUG-015: Update search_feed_id when switching feeds during search mode
+            if app.search_mode {
+                app.search_feed_id = Some(feed_id);
+            }
             app.articles = Arc::new(app.db.get_articles_for_feed(feed_id, None).await?);
             app.selected_article = 0;
             app.clamp_selections();
@@ -230,13 +278,15 @@ async fn handle_refresh_all(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) {
                 let rate_limit_tx = tx.clone();
 
                 // Spawn the refresh in a separate task
-                let refresh_handle = tokio::spawn(async move {
+                let mut refresh_handle = tokio::spawn(async move {
                     refresh_all(db, client, feeds, progress_tx_for_task, Some(rate_limit_tx))
                         .await
                 });
 
                 // Forward progress updates with timeout safety net
                 // RES-001: Receiver loop terminates when sender drops OR timeout
+                // B-2: Also monitor refresh_handle to detect panics immediately
+                let mut handle_result = None;
                 loop {
                     tokio::select! {
                         Some((done, total)) = progress_rx.recv() => {
@@ -244,8 +294,16 @@ async fn handle_refresh_all(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) {
                                 tracing::warn!(error = %e, event = "RefreshProgress", "Channel send failed (receiver dropped)");
                             }
                         }
-                        _ = tokio::time::sleep(Duration::from_secs(120)) => {
-                            tracing::warn!("Progress receiver timed out after 120s");
+                        result = &mut refresh_handle => {
+                            // B-2: Refresh task completed (success or panic) — break immediately
+                            if let Err(ref e) = result {
+                                tracing::warn!(error = %e, "Refresh task panicked");
+                            }
+                            handle_result = Some(result);
+                            break;
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                            tracing::warn!("Progress receiver timed out after 30s");
                             break;
                         }
                         else => break, // Channel closed (sender dropped)
@@ -253,7 +311,12 @@ async fn handle_refresh_all(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) {
                 }
 
                 // Get results and send completion
-                if let Ok(results) = refresh_handle.await {
+                // B-2: Use cached result if handle completed in select, otherwise await
+                let join_result = match handle_result {
+                    Some(r) => r,
+                    None => refresh_handle.await,
+                };
+                if let Ok(results) = join_result {
                     let fetch_results: Vec<FetchResult> = results
                         .into_iter()
                         .map(|r| {
@@ -351,16 +414,16 @@ async fn handle_star_toggle_browse(app: &mut App, event_tx: &mpsc::Sender<AppEve
         let article_id = article.id;
         let current_starred = article.starred;
 
+        // SAFETY: All Arc::make_mut calls on app.articles must happen on the event loop
+        // thread (never in spawned tasks). Background tasks may hold Arc clones for reading
+        // but must never mutate. This ensures sequential access without locks.
         // PERF-015: Use Arc::make_mut for copy-on-write optimization
         // Only clones the Vec if there are other references, otherwise mutates in place
         let articles = Arc::make_mut(&mut app.articles);
         if let Some(article) = articles.iter_mut().find(|a| a.id == article_id) {
             article.starred = !current_starred;
         }
-        // Also update in whats_new if present
-        if let Some((_, article)) = app.whats_new.iter_mut().find(|(_, a)| a.id == article_id) {
-            article.starred = !current_starred;
-        }
+        // PERF-023: WhatsNewEntry is display-only; no starred field to update
         app.needs_redraw = true;
 
         // Invalidate cache if it exists - prevents stale data on search/starred mode exit
@@ -415,6 +478,223 @@ async fn handle_star_toggle_browse(app: &mut App, event_tx: &mpsc::Sender<AppEve
     }
 }
 
+/// Handle mark all articles read for current feed (a key).
+async fn handle_mark_feed_read(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) {
+    let Some(feed) = app.selected_feed() else {
+        return;
+    };
+    let feed_id = feed.id;
+
+    // Optimistic UI: mark all visible articles as read
+    let articles = Arc::make_mut(&mut app.articles);
+    for article in articles.iter_mut() {
+        if article.feed_id == feed_id {
+            article.read = true;
+        }
+    }
+    // PERF-023: WhatsNewEntry is display-only; no read field to update
+    app.cached_articles = None;
+    app.needs_redraw = true;
+
+    // Spawn background task to persist
+    let db = app.db.clone();
+    let tx = event_tx.clone();
+    tokio::spawn(async move {
+        let tx_panic = tx.clone();
+        match catch_task_panic(async {
+            match db.mark_all_read_for_feed(feed_id).await {
+                Ok(count) => {
+                    if let Err(e) = tx
+                        .send(AppEvent::BulkMarkReadComplete {
+                            feed_id: Some(feed_id),
+                            count,
+                        })
+                        .await
+                    {
+                        tracing::warn!(error = %e, event = "BulkMarkReadComplete", "Channel send failed (receiver dropped)");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, feed_id, "Failed to mark feed read");
+                    if let Err(e) = tx
+                        .send(AppEvent::BulkMarkReadFailed {
+                            feed_id: Some(feed_id),
+                            error: e.to_string(),
+                        })
+                        .await
+                    {
+                        tracing::warn!(error = %e, event = "BulkMarkReadFailed", "Channel send failed (receiver dropped)");
+                    }
+                }
+            }
+        })
+        .await
+        {
+            Ok(()) => {}
+            Err(panic_msg) => {
+                tracing::error!(task = "mark_feed_read", feed_id, error = %panic_msg, "Background task panicked");
+                let _ = tx_panic
+                    .send(AppEvent::TaskPanicked {
+                        task: "mark_feed_read",
+                        error: panic_msg,
+                    })
+                    .await;
+            }
+        }
+    });
+}
+
+/// Handle mark all articles read across all feeds (A key).
+async fn handle_mark_all_read(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) {
+    // Optimistic UI: mark all visible articles as read
+    let articles = Arc::make_mut(&mut app.articles);
+    for article in articles.iter_mut() {
+        article.read = true;
+    }
+    // PERF-023: WhatsNewEntry is display-only; no read field to update
+    app.cached_articles = None;
+    app.needs_redraw = true;
+
+    // Spawn background task to persist
+    let db = app.db.clone();
+    let tx = event_tx.clone();
+    tokio::spawn(async move {
+        let tx_panic = tx.clone();
+        match catch_task_panic(async {
+            match db.mark_all_read().await {
+                Ok(count) => {
+                    if let Err(e) = tx
+                        .send(AppEvent::BulkMarkReadComplete {
+                            feed_id: None,
+                            count,
+                        })
+                        .await
+                    {
+                        tracing::warn!(error = %e, event = "BulkMarkReadComplete", "Channel send failed (receiver dropped)");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to mark all read");
+                    if let Err(e) = tx
+                        .send(AppEvent::BulkMarkReadFailed {
+                            feed_id: None,
+                            error: e.to_string(),
+                        })
+                        .await
+                    {
+                        tracing::warn!(error = %e, event = "BulkMarkReadFailed", "Channel send failed (receiver dropped)");
+                    }
+                }
+            }
+        })
+        .await
+        {
+            Ok(()) => {}
+            Err(panic_msg) => {
+                tracing::error!(task = "mark_all_read", error = %panic_msg, "Background task panicked");
+                let _ = tx_panic
+                    .send(AppEvent::TaskPanicked {
+                        task: "mark_all_read",
+                        error: panic_msg,
+                    })
+                    .await;
+            }
+        }
+    });
+}
+
+/// Handle OPML export (e key in feed panel).
+fn handle_export_opml(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) {
+    app.set_status("Exporting feeds...");
+
+    let db = app.db.clone();
+    let tx = event_tx.clone();
+    tokio::spawn(async move {
+        let tx_panic = tx.clone();
+        match catch_task_panic(async {
+            // Get feeds from DB
+            let storage_feeds = match db.get_feeds_for_export().await {
+                Ok(feeds) => feeds,
+                Err(e) => {
+                    let _ = tx
+                        .send(AppEvent::ExportFailed {
+                            error: e.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            };
+
+            let count = storage_feeds.len();
+
+            // Convert storage::OpmlFeed to feed::OpmlFeed
+            let opml_feeds: Vec<crate::feed::OpmlFeed> = storage_feeds
+                .into_iter()
+                .map(|f| crate::feed::OpmlFeed {
+                    title: f.title,
+                    xml_url: f.xml_url,
+                    html_url: f.html_url,
+                })
+                .collect();
+
+            // Determine export path
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            let config_dir = std::path::PathBuf::from(&home).join(".config/skim");
+            let export_path = config_dir.join("feeds-export.opml");
+
+            // S-8: Verify config directory exists and is within expected location
+            if let Ok(canonical_config) = config_dir.canonicalize() {
+                if !export_path.starts_with(&canonical_config) {
+                    let _ = tx
+                        .send(AppEvent::ExportFailed {
+                            error: "Export path is outside config directory".to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            }
+
+            match crate::feed::export_to_file(&opml_feeds, &export_path) {
+                Ok(()) => {
+                    let path_str = export_path.display().to_string();
+                    if let Err(e) = tx
+                        .send(AppEvent::ExportComplete {
+                            count,
+                            path: path_str,
+                        })
+                        .await
+                    {
+                        tracing::warn!(error = %e, event = "ExportComplete", "Channel send failed (receiver dropped)");
+                    }
+                }
+                Err(e) => {
+                    if let Err(e) = tx
+                        .send(AppEvent::ExportFailed {
+                            error: e.to_string(),
+                        })
+                        .await
+                    {
+                        tracing::warn!(error = %e, event = "ExportFailed", "Channel send failed (receiver dropped)");
+                    }
+                }
+            }
+        })
+        .await
+        {
+            Ok(()) => {}
+            Err(panic_msg) => {
+                tracing::error!(task = "export_opml", error = %panic_msg, "Background task panicked");
+                let _ = tx_panic
+                    .send(AppEvent::TaskPanicked {
+                        task: "export_opml",
+                        error: panic_msg,
+                    })
+                    .await;
+            }
+        }
+    });
+}
+
 /// Handle starred mode toggle (S key).
 async fn handle_starred_mode_toggle(app: &mut App) -> Result<()> {
     if app.starred_mode {
@@ -463,31 +743,37 @@ async fn handle_starred_mode_toggle(app: &mut App) -> Result<()> {
 }
 
 /// Handle input in reader view.
+///
+/// Uses keybinding registry for action dispatch with Reader context.
 pub(super) fn handle_reader_input(
     app: &mut App,
     code: KeyCode,
     modifiers: KeyModifiers,
     event_tx: &mpsc::Sender<AppEvent>,
 ) -> Result<Action> {
-    match code {
-        KeyCode::Char('q') => return Ok(Action::Quit),
-        KeyCode::Char('b') | KeyCode::Esc => {
+    let action = app
+        .keybindings
+        .action_for_key(code, modifiers, KbContext::Reader);
+
+    match action {
+        Some(KbAction::Quit) => return Ok(Action::Quit),
+        Some(KbAction::ExitReader) => {
             app.exit_reader();
         }
-        KeyCode::Char('j') | KeyCode::Down => {
+        Some(KbAction::ScrollDown) => {
             app.scroll_down(1);
             app.clamp_reader_scroll();
         }
-        KeyCode::Char('k') | KeyCode::Up => app.scroll_up(1),
-        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+        Some(KbAction::ScrollUp) => app.scroll_up(1),
+        Some(KbAction::PageDown) => {
             app.scroll_down(20);
             app.clamp_reader_scroll();
         }
-        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll_up(20),
-        KeyCode::Char('s') => {
+        Some(KbAction::PageUp) => app.scroll_up(20),
+        Some(KbAction::ToggleStar) => {
             handle_star_toggle_reader(app, event_tx);
         }
-        KeyCode::Char('o') => {
+        Some(KbAction::OpenInBrowser) => {
             if let Some(article) = app.reader_article.as_ref() {
                 if let Some(url) = &article.url {
                     // SEC: Validate URL before open::that() to prevent command injection
@@ -607,10 +893,10 @@ async fn handle_search_input(app: &mut App, code: KeyCode) -> Result<Action> {
         }
         KeyCode::Char(c) => {
             // Prevent input beyond max search length
-            if app.search_input.len() >= MAX_SEARCH_LENGTH {
+            if app.search_input.len() >= MAX_SEARCH_QUERY_LENGTH {
                 app.set_status(format!(
                     "Search query at max length ({} chars)",
-                    MAX_SEARCH_LENGTH
+                    MAX_SEARCH_QUERY_LENGTH
                 ));
                 return Ok(Action::Continue);
             }
