@@ -3,9 +3,13 @@
 //! This module processes keyboard input and dispatches to the appropriate
 //! handler based on current view and mode.
 
-use crate::app::{App, AppEvent, CachedArticleState, ContentState, FetchResult, Focus, View};
-use crate::feed::{refresh_all, refresh_one};
+use crate::app::{
+    App, AppEvent, CachedArticleState, ConfirmAction, ContentState, ContextMenuState,
+    ContextMenuSubState, FetchResult, Focus, SubscribeState, View, CONTEXT_MENU_ITEMS,
+};
+use crate::feed::{discover_feed, refresh_all, refresh_one};
 use crate::keybindings::{Action as KbAction, Context as KbContext};
+use crate::util::validate_url;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::sync::Arc;
@@ -22,6 +26,7 @@ use crate::util::{validate_url_for_open, MAX_SEARCH_QUERY_LENGTH};
 /// Map the current focus panel to a keybinding context for context-specific lookups.
 fn focus_to_context(focus: Focus) -> KbContext {
     match focus {
+        Focus::Categories => KbContext::Categories,
         Focus::Feeds => KbContext::FeedList,
         Focus::Articles => KbContext::ArticleList,
         Focus::WhatsNew => KbContext::WhatsNew,
@@ -40,6 +45,21 @@ pub(super) async fn handle_input(
     // Handle help overlay input first (captures all keys when visible)
     if app.show_help {
         return Ok(handle_help_input(app, code));
+    }
+
+    // Handle confirmation dialog input (captures all keys when visible)
+    if app.pending_confirm.is_some() {
+        return handle_confirm_input(app, code, event_tx);
+    }
+
+    // Handle subscribe dialog input (captures all keys when visible)
+    if app.subscribe_state.is_some() {
+        return handle_subscribe_input(app, code, event_tx).await;
+    }
+
+    // Handle context menu input (captures all keys when visible)
+    if app.context_menu.is_some() {
+        return handle_context_menu_input(app, code, event_tx).await;
     }
 
     // Handle search mode input separately
@@ -96,19 +116,56 @@ async fn handle_browse_input(
         Some(KbAction::NavDown) => app.nav_down(),
         Some(KbAction::NavUp) => app.nav_up(),
         Some(KbAction::CycleFocus) => {
-            app.focus = if app.show_whats_new {
-                match app.focus {
-                    Focus::WhatsNew => Focus::Feeds,
-                    Focus::Feeds => Focus::Articles,
-                    Focus::Articles => Focus::WhatsNew,
-                }
-            } else {
-                match app.focus {
-                    Focus::Feeds => Focus::Articles,
-                    Focus::Articles => Focus::Feeds,
-                    Focus::WhatsNew => Focus::Feeds, // Shouldn't happen, but handle gracefully
-                }
+            let has_cats = app.show_categories;
+            let has_wn = app.show_whats_new && !app.whats_new.is_empty();
+            app.focus = match (has_wn, has_cats, app.focus) {
+                // With What's New + Categories: WN → Cat → Feeds → Articles → WN
+                (true, true, Focus::WhatsNew) => Focus::Categories,
+                (true, true, Focus::Categories) => Focus::Feeds,
+                (true, true, Focus::Feeds) => Focus::Articles,
+                (true, true, Focus::Articles) => Focus::WhatsNew,
+                // With What's New only: WN → Feeds → Articles → WN
+                (true, false, Focus::WhatsNew) => Focus::Feeds,
+                (true, false, Focus::Feeds) => Focus::Articles,
+                (true, false, Focus::Articles) => Focus::WhatsNew,
+                (true, false, Focus::Categories) => Focus::Feeds,
+                // With Categories only: Cat → Feeds → Articles → Cat
+                (false, true, Focus::Categories) => Focus::Feeds,
+                (false, true, Focus::Feeds) => Focus::Articles,
+                (false, true, Focus::Articles) => Focus::Categories,
+                (false, true, Focus::WhatsNew) => Focus::Categories,
+                // Neither: Feeds → Articles → Feeds
+                (false, false, Focus::Feeds) => Focus::Articles,
+                (false, false, Focus::Articles) => Focus::Feeds,
+                (false, false, _) => Focus::Feeds,
             };
+        }
+        Some(KbAction::ToggleCategories) => {
+            app.show_categories = !app.show_categories;
+            if !app.show_categories && app.focus == Focus::Categories {
+                app.focus = Focus::Feeds;
+            }
+            app.needs_redraw = true;
+        }
+        Some(KbAction::CollapseCategory) => {
+            if app.focus == Focus::Categories {
+                if let Some(cat_id) = app.selected_category_id() {
+                    if !app.collapsed_categories.contains(&cat_id) {
+                        app.toggle_category_collapse(cat_id);
+                        app.needs_redraw = true;
+                    }
+                }
+            }
+        }
+        Some(KbAction::ExpandCategory) => {
+            if app.focus == Focus::Categories {
+                if let Some(cat_id) = app.selected_category_id() {
+                    if app.collapsed_categories.contains(&cat_id) {
+                        app.toggle_category_collapse(cat_id);
+                        app.needs_redraw = true;
+                    }
+                }
+            }
         }
         Some(KbAction::Select) => {
             handle_enter_key(app, event_tx).await?;
@@ -185,7 +242,394 @@ async fn handle_browse_input(
             app.show_help = true;
             app.help_scroll_offset = 0;
         }
+        Some(KbAction::DeleteFeed) => {
+            if let Some(feed) = app.selected_feed() {
+                let feed_id = feed.id;
+                let title = feed.title.to_string();
+                app.pending_confirm = Some(ConfirmAction::DeleteFeed { feed_id, title });
+            }
+        }
+        Some(KbAction::Subscribe) => {
+            app.subscribe_state = Some(SubscribeState::InputUrl {
+                input: String::new(),
+            });
+        }
+        Some(KbAction::ContextMenu) => {
+            if let Some(feed) = app.selected_feed() {
+                app.context_menu = Some(ContextMenuState {
+                    feed_id: feed.id,
+                    feed_title: feed.title.to_string(),
+                    feed_url: feed.url.clone(),
+                    feed_html_url: feed.html_url.clone(),
+                    selected_item: 0,
+                    sub_state: ContextMenuSubState::MainMenu,
+                });
+            }
+        }
         _ => {}
+    }
+    Ok(Action::Continue)
+}
+
+/// Handle input while the context menu is visible.
+async fn handle_context_menu_input(
+    app: &mut App,
+    code: KeyCode,
+    event_tx: &mpsc::Sender<AppEvent>,
+) -> Result<Action> {
+    // Take ownership temporarily to match on sub_state
+    let mut menu = match app.context_menu.take() {
+        Some(m) => m,
+        None => return Ok(Action::Continue),
+    };
+
+    match menu.sub_state {
+        ContextMenuSubState::MainMenu => match code {
+            KeyCode::Char('k') | KeyCode::Up => {
+                menu.selected_item = menu.selected_item.saturating_sub(1);
+                app.context_menu = Some(menu);
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                menu.selected_item = (menu.selected_item + 1).min(CONTEXT_MENU_ITEMS.len() - 1);
+                app.context_menu = Some(menu);
+            }
+            KeyCode::Enter => {
+                match menu.selected_item {
+                    0 => {
+                        // Rename: transition to Renaming sub-state
+                        menu.sub_state = ContextMenuSubState::Renaming {
+                            input: menu.feed_title.clone(),
+                        };
+                        app.context_menu = Some(menu);
+                    }
+                    1 => {
+                        // Move to Category: transition to CategoryPicker
+                        menu.sub_state = ContextMenuSubState::CategoryPicker { selected: 0 };
+                        app.context_menu = Some(menu);
+                    }
+                    2 => {
+                        // Delete: close menu, delegate to confirmation flow
+                        app.pending_confirm = Some(ConfirmAction::DeleteFeed {
+                            feed_id: menu.feed_id,
+                            title: menu.feed_title,
+                        });
+                        // context_menu is already None from take()
+                    }
+                    3 => {
+                        // Refresh: close menu, spawn refresh_one
+                        // context_menu is already None from take()
+                        handle_refresh_one(app, event_tx).await;
+                    }
+                    4 => {
+                        // Open in Browser: validate URL, open
+                        // context_menu is already None from take()
+                        let url = menu.feed_html_url.as_deref().unwrap_or(&menu.feed_url);
+                        // SEC: Validate URL before open::that() to prevent command injection
+                        if let Err(e) = validate_url_for_open(url) {
+                            app.set_status(e);
+                        } else if let Err(e) = open::that(url) {
+                            app.set_status(format!("Failed to open browser: {}", e));
+                        } else {
+                            app.set_status(format!("Opening {}...", menu.feed_title));
+                        }
+                    }
+                    _ => {
+                        app.context_menu = Some(menu);
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                // Cancel — context_menu is already None from take()
+            }
+            _ => {
+                app.context_menu = Some(menu);
+            }
+        },
+        ContextMenuSubState::Renaming { ref mut input } => match code {
+            KeyCode::Char(c) => {
+                // SEC-017: Cap rename input length to prevent memory abuse
+                if input.len() < 256 {
+                    input.push(c);
+                }
+                app.context_menu = Some(menu);
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                app.context_menu = Some(menu);
+            }
+            KeyCode::Enter => {
+                let new_title = input.trim().to_owned();
+                if new_title.is_empty() {
+                    app.set_status("Name cannot be empty");
+                    app.context_menu = Some(menu);
+                } else {
+                    // Spawn rename task
+                    let feed_id = menu.feed_id;
+                    let db = app.db.clone();
+                    let tx = event_tx.clone();
+                    let title = new_title.clone();
+                    tokio::spawn(async move {
+                        match db.rename_feed(feed_id, &title).await {
+                            Ok(()) => {
+                                let _ = tx
+                                    .send(AppEvent::FeedRenamed {
+                                        feed_id,
+                                        new_title: title,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(AppEvent::FeedRenameFailed {
+                                        feed_id,
+                                        error: e.to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                    // context_menu is already None from take()
+                }
+            }
+            KeyCode::Esc => {
+                // Return to main menu
+                menu.sub_state = ContextMenuSubState::MainMenu;
+                app.context_menu = Some(menu);
+            }
+            _ => {
+                app.context_menu = Some(menu);
+            }
+        },
+        ContextMenuSubState::CategoryPicker { ref mut selected } => {
+            // Category list: index 0 = "Uncategorized", then each category
+            let cat_count = app.categories.len() + 1; // +1 for Uncategorized
+            match code {
+                KeyCode::Char('k') | KeyCode::Up => {
+                    *selected = selected.saturating_sub(1);
+                    app.context_menu = Some(menu);
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    *selected = (*selected + 1).min(cat_count.saturating_sub(1));
+                    app.context_menu = Some(menu);
+                }
+                KeyCode::Enter => {
+                    let selected_idx = *selected;
+                    let feed_id = menu.feed_id;
+                    let (category_id, category_name) = if selected_idx == 0 {
+                        (None, "Uncategorized".to_string())
+                    } else {
+                        let cat = &app.categories[selected_idx - 1];
+                        (Some(cat.id), cat.name.clone())
+                    };
+
+                    let db = app.db.clone();
+                    let tx = event_tx.clone();
+                    let cat_name = category_name.clone();
+                    tokio::spawn(async move {
+                        match db.move_feed_to_category(feed_id, category_id).await {
+                            Ok(()) => {
+                                let _ = tx
+                                    .send(AppEvent::FeedMoved {
+                                        feed_id,
+                                        category_id,
+                                        category_name: cat_name,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(AppEvent::FeedMoveFailed {
+                                        feed_id,
+                                        error: e.to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                    // context_menu is already None from take()
+                }
+                KeyCode::Esc => {
+                    // Return to main menu
+                    menu.sub_state = ContextMenuSubState::MainMenu;
+                    app.context_menu = Some(menu);
+                }
+                _ => {
+                    app.context_menu = Some(menu);
+                }
+            }
+        }
+    }
+    Ok(Action::Continue)
+}
+
+/// Handle input while the subscribe dialog is visible.
+async fn handle_subscribe_input(
+    app: &mut App,
+    code: KeyCode,
+    event_tx: &mpsc::Sender<AppEvent>,
+) -> Result<Action> {
+    // Take ownership temporarily to match on state
+    let state = app.subscribe_state.take();
+    match state {
+        Some(SubscribeState::InputUrl { mut input }) => match code {
+            KeyCode::Char(c) => {
+                // SEC-017: Cap URL input length to prevent memory abuse from held keys
+                if input.len() < 2048 {
+                    input.push(c);
+                }
+                app.subscribe_state = Some(SubscribeState::InputUrl { input });
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                app.subscribe_state = Some(SubscribeState::InputUrl { input });
+            }
+            KeyCode::Enter => {
+                let url = input.trim().to_owned();
+                if url.is_empty() {
+                    app.subscribe_state = Some(SubscribeState::InputUrl { input });
+                    return Ok(Action::Continue);
+                }
+                // Validate URL before discovery
+                if let Err(e) = validate_url(&url) {
+                    app.set_status(format!("Invalid URL: {}", e));
+                    app.subscribe_state = Some(SubscribeState::InputUrl { input });
+                    return Ok(Action::Continue);
+                }
+                // Transition to Discovering and spawn background task
+                app.subscribe_state = Some(SubscribeState::Discovering { url: url.clone() });
+                let client = app.http_client.clone();
+                let tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let result = discover_feed(&client, &url).await;
+                    let _ = tx
+                        .send(AppEvent::FeedDiscovered {
+                            url: url.clone(),
+                            result: result.map_err(|e| e.to_string()),
+                        })
+                        .await;
+                });
+            }
+            KeyCode::Esc => {
+                // Cancel — subscribe_state is already None from take()
+            }
+            _ => {
+                app.subscribe_state = Some(SubscribeState::InputUrl { input });
+            }
+        },
+        Some(SubscribeState::Discovering { url }) => {
+            if code == KeyCode::Esc {
+                // Cancel — ignore result when it arrives (state is already None)
+                app.set_status("Subscribe cancelled");
+            } else {
+                // Keep state; only Esc cancels during discovery
+                app.subscribe_state = Some(SubscribeState::Discovering { url });
+            }
+        }
+        Some(SubscribeState::Preview { feed }) => match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                // Confirm subscription — insert feed into DB
+                let title = feed.title.clone();
+                let feed_url = feed.feed_url.clone();
+                let site_url = feed.site_url.clone();
+                let db = app.db.clone();
+                let tx = event_tx.clone();
+                tokio::spawn(async move {
+                    match db.insert_feed(&feed_url, &title, site_url.as_deref()).await {
+                        Ok(_) => {
+                            let _ = tx.send(AppEvent::FeedSubscribed { title }).await;
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(AppEvent::FeedSubscribeFailed {
+                                    error: e.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                });
+                // subscribe_state is already None from take()
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.set_status("Subscribe cancelled");
+                // subscribe_state is already None from take()
+            }
+            _ => {
+                app.subscribe_state = Some(SubscribeState::Preview { feed });
+            }
+        },
+        None => {
+            // Should not happen; defensive
+        }
+    }
+    Ok(Action::Continue)
+}
+
+/// Handle input while the confirmation dialog is visible.
+///
+/// y/Y confirms the action, n/N/Esc cancels.
+fn handle_confirm_input(
+    app: &mut App,
+    code: KeyCode,
+    event_tx: &mpsc::Sender<AppEvent>,
+) -> Result<Action> {
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            if let Some(ConfirmAction::DeleteFeed { feed_id, title }) = app.pending_confirm.take() {
+                app.set_status(format!("Deleting {}...", title));
+
+                let db = app.db.clone();
+                let tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let tx_panic = tx.clone();
+                    match catch_task_panic(async {
+                        match db.delete_feed(feed_id).await {
+                            Ok(articles_removed) => {
+                                if let Err(e) = tx
+                                    .send(AppEvent::FeedDeleted {
+                                        feed_id,
+                                        title,
+                                        articles_removed,
+                                    })
+                                    .await
+                                {
+                                    tracing::warn!(error = %e, event = "FeedDeleted", "Channel send failed (receiver dropped)");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, feed_id, "Failed to delete feed");
+                                if let Err(e) = tx
+                                    .send(AppEvent::FeedDeleteFailed {
+                                        feed_id,
+                                        error: e.to_string(),
+                                    })
+                                    .await
+                                {
+                                    tracing::warn!(error = %e, event = "FeedDeleteFailed", "Channel send failed (receiver dropped)");
+                                }
+                            }
+                        }
+                    })
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(panic_msg) => {
+                            tracing::error!(task = "delete_feed", feed_id, error = %panic_msg, "Background task panicked");
+                            let _ = tx_panic
+                                .send(AppEvent::TaskPanicked {
+                                    task: "delete_feed",
+                                    error: panic_msg,
+                                })
+                                .await;
+                        }
+                    }
+                });
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.pending_confirm = None;
+            app.set_status("Cancelled");
+        }
+        _ => {} // Ignore other keys
     }
     Ok(Action::Continue)
 }
@@ -218,6 +662,12 @@ async fn handle_enter_key(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) -> R
         } else {
             app.set_status("No new articles");
         }
+    } else if app.focus == Focus::Categories {
+        // Category selected → filter feeds, move focus to Feeds panel
+        app.focus = Focus::Feeds;
+        app.selected_feed = 0;
+        app.selected_article = 0;
+        app.needs_redraw = true;
     } else if app.focus == Focus::Feeds {
         // Load articles for selected feed
         if let Some(feed) = app.selected_feed() {
@@ -607,36 +1057,15 @@ async fn handle_mark_all_read(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) 
 fn handle_export_opml(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) {
     app.set_status("Exporting feeds...");
 
-    let db = app.db.clone();
+    // Snapshot feeds and categories from in-memory state (Arc::clone is O(1))
+    let feeds = Arc::clone(&app.feeds);
+    let categories = Arc::clone(&app.categories);
+    let count = feeds.len();
     let tx = event_tx.clone();
+
     tokio::spawn(async move {
         let tx_panic = tx.clone();
         match catch_task_panic(async {
-            // Get feeds from DB
-            let storage_feeds = match db.get_feeds_for_export().await {
-                Ok(feeds) => feeds,
-                Err(e) => {
-                    let _ = tx
-                        .send(AppEvent::ExportFailed {
-                            error: e.to_string(),
-                        })
-                        .await;
-                    return;
-                }
-            };
-
-            let count = storage_feeds.len();
-
-            // Convert storage::OpmlFeed to feed::OpmlFeed
-            let opml_feeds: Vec<crate::feed::OpmlFeed> = storage_feeds
-                .into_iter()
-                .map(|f| crate::feed::OpmlFeed {
-                    title: f.title,
-                    xml_url: f.xml_url,
-                    html_url: f.html_url,
-                })
-                .collect();
-
             // Determine export path
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
             let config_dir = std::path::PathBuf::from(&home).join(".config/skim");
@@ -654,7 +1083,13 @@ fn handle_export_opml(app: &mut App, event_tx: &mpsc::Sender<AppEvent>) {
                 }
             }
 
-            match crate::feed::export_to_file(&opml_feeds, &export_path) {
+            let result = crate::feed::export_to_file_with_categories(
+                &feeds,
+                &categories,
+                &export_path,
+            );
+
+            match result {
                 Ok(()) => {
                     let path_str = export_path.display().to_string();
                     if let Err(e) = tx

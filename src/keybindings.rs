@@ -37,6 +37,12 @@ pub enum Action {
     ExitReader,
     CycleTheme,
     ShowHelp,
+    DeleteFeed,
+    Subscribe,
+    ToggleCategories,
+    CollapseCategory,
+    ExpandCategory,
+    ContextMenu,
 }
 
 impl Action {
@@ -68,6 +74,12 @@ impl Action {
             Self::ExitReader => "Exit reader view",
             Self::CycleTheme => "Cycle theme",
             Self::ShowHelp => "Show help",
+            Self::DeleteFeed => "Delete feed",
+            Self::Subscribe => "Subscribe to feed",
+            Self::ToggleCategories => "Toggle category panel",
+            Self::CollapseCategory => "Collapse category",
+            Self::ExpandCategory => "Expand category",
+            Self::ContextMenu => "Feed context menu",
         }
     }
 }
@@ -85,6 +97,7 @@ pub enum Context {
     Reader,
     Search,
     WhatsNew,
+    Categories,
 }
 
 // ============================================================================
@@ -329,6 +342,27 @@ impl KeybindingRegistry {
             Action::ExportOpml,
         );
 
+        // Delete feed (feed list context)
+        self.bind(
+            Context::FeedList,
+            KeySpec::plain(KeyCode::Char('d')),
+            Action::DeleteFeed,
+        );
+
+        // Subscribe to feed (feed list context)
+        self.bind(
+            Context::FeedList,
+            KeySpec::plain(KeyCode::Char('+')),
+            Action::Subscribe,
+        );
+
+        // Feed context menu (feed list context)
+        self.bind(
+            Context::FeedList,
+            KeySpec::plain(KeyCode::Char('m')),
+            Action::ContextMenu,
+        );
+
         // Theme + Help (new actions)
         self.bind(
             Context::Global,
@@ -339,6 +373,35 @@ impl KeybindingRegistry {
             Context::Global,
             KeySpec::plain(KeyCode::Char('?')),
             Action::ShowHelp,
+        );
+
+        // Categories panel toggle
+        self.bind(
+            Context::Global,
+            KeySpec::plain(KeyCode::Char('c')),
+            Action::ToggleCategories,
+        );
+
+        // Category-specific keys
+        self.bind(
+            Context::Categories,
+            KeySpec::plain(KeyCode::Left),
+            Action::CollapseCategory,
+        );
+        self.bind(
+            Context::Categories,
+            KeySpec::plain(KeyCode::Char('h')),
+            Action::CollapseCategory,
+        );
+        self.bind(
+            Context::Categories,
+            KeySpec::plain(KeyCode::Right),
+            Action::ExpandCategory,
+        );
+        self.bind(
+            Context::Categories,
+            KeySpec::plain(KeyCode::Char('l')),
+            Action::ExpandCategory,
         );
 
         // === Reader view ===
@@ -543,6 +606,12 @@ fn parse_action_name(name: &str) -> Option<Action> {
         "exit_reader" | "exitreader" => Some(Action::ExitReader),
         "cycle_theme" | "cycletheme" | "theme" => Some(Action::CycleTheme),
         "show_help" | "showhelp" | "help" => Some(Action::ShowHelp),
+        "delete_feed" | "deletefeed" | "delete" => Some(Action::DeleteFeed),
+        "subscribe" | "add_feed" | "addfeed" => Some(Action::Subscribe),
+        "toggle_categories" | "togglecategories" | "categories" => Some(Action::ToggleCategories),
+        "collapse_category" | "collapsecategory" => Some(Action::CollapseCategory),
+        "expand_category" | "expandcategory" => Some(Action::ExpandCategory),
+        "context_menu" | "contextmenu" | "menu" => Some(Action::ContextMenu),
         _ => None,
     }
 }

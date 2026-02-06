@@ -14,9 +14,10 @@ use ratatui::{
 };
 
 /// Context display order and labels for the help screen.
-const CONTEXT_ORDER: [(Context, &str); 5] = [
+const CONTEXT_ORDER: [(Context, &str); 6] = [
     (Context::Global, "General"),
     (Context::FeedList, "Feed List"),
+    (Context::Categories, "Categories"),
     (Context::ArticleList, "Article List"),
     (Context::Reader, "Reader"),
     (Context::Search, "Search"),

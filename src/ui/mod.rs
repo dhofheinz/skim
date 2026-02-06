@@ -21,6 +21,7 @@
 
 // Submodules for UI components
 mod articles;
+mod categories;
 mod events;
 mod feeds;
 mod help;

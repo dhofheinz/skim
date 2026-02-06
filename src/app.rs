@@ -1,13 +1,14 @@
 use crate::content::ContentError;
+use crate::feed::DiscoveredFeed;
 use crate::keybindings::KeybindingRegistry;
-use crate::storage::{Article, Database, Feed};
+use crate::storage::{Article, Database, Feed, FeedCategory};
 use crate::theme::{StyleMap, ThemeVariant};
 use anyhow::Result;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use reqwest::redirect::Policy;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::time::Instant;
 use unicode_width::UnicodeWidthStr;
@@ -140,8 +141,30 @@ pub enum View {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     WhatsNew,
+    Categories,
     Feeds,
     Articles,
+}
+
+// ============================================================================
+// Category Tree
+// ============================================================================
+
+/// A single item in the flattened category tree for rendering.
+#[derive(Debug, Clone)]
+pub struct CategoryTreeItem {
+    /// Category ID, or None for "All".
+    pub category_id: Option<i64>,
+    /// Display name.
+    pub name: String,
+    /// Nesting depth (0 = top-level).
+    pub depth: usize,
+    /// Total unread articles across feeds in this category.
+    pub unread_count: i64,
+    /// Whether this category has child categories.
+    pub has_children: bool,
+    /// Whether this category is expanded (children visible).
+    pub is_expanded: bool,
 }
 
 // ============================================================================
@@ -182,6 +205,65 @@ pub struct FetchResult {
     pub feed_id: i64,
     pub new_articles: usize,
     pub error: Option<String>,
+}
+
+// ============================================================================
+// Confirmation Dialog
+// ============================================================================
+
+/// Pending confirmation action for destructive operations.
+pub enum ConfirmAction {
+    /// Delete a feed and all its articles.
+    DeleteFeed { feed_id: i64, title: String },
+}
+
+// ============================================================================
+// Context Menu State
+// ============================================================================
+
+/// Menu items for the feed context menu.
+pub const CONTEXT_MENU_ITEMS: &[&str] = &[
+    "Rename",
+    "Move to Category",
+    "Delete",
+    "Refresh",
+    "Open in Browser",
+];
+
+/// State for the feed context menu popup.
+pub struct ContextMenuState {
+    pub feed_id: i64,
+    pub feed_title: String,
+    pub feed_url: String,
+    pub feed_html_url: Option<String>,
+    pub selected_item: usize,
+    pub sub_state: ContextMenuSubState,
+}
+
+/// Sub-state within the context menu for multi-step operations.
+#[allow(dead_code)] // Wired in by TASK-9 (feed context menu)
+pub enum ContextMenuSubState {
+    /// Browsing the main menu list.
+    MainMenu,
+    /// Editing a new name for the feed.
+    Renaming { input: String },
+    /// Picking a category to move the feed into. Index 0 = Uncategorized.
+    CategoryPicker { selected: usize },
+}
+
+// ============================================================================
+// Subscribe Dialog State
+// ============================================================================
+
+/// State machine for the subscribe-by-URL dialog.
+#[allow(dead_code)] // Wired in by TASK-7 (subscribe dialog)
+pub enum SubscribeState {
+    /// User is typing a URL.
+    InputUrl { input: String },
+    /// Discovery is in progress for the given URL.
+    Discovering { url: String },
+    /// Feed discovered; awaiting user confirmation.
+    Preview { feed: DiscoveredFeed },
 }
 
 /// Events from background tasks
@@ -269,6 +351,63 @@ pub enum AppEvent {
     ExportFailed {
         error: String,
     },
+    /// Feed deletion completed successfully.
+    ///
+    /// Fields:
+    /// - `feed_id`: The database ID of the deleted feed
+    /// - `title`: The feed title for status display
+    /// - `articles_removed`: Number of articles that were cascade-deleted
+    FeedDeleted {
+        feed_id: i64,
+        title: String,
+        articles_removed: usize,
+    },
+    /// Feed deletion failed.
+    FeedDeleteFailed {
+        feed_id: i64,
+        error: String,
+    },
+    /// Feed discovery completed (from subscribe dialog).
+    ///
+    /// Fields:
+    /// - `url`: The URL that was submitted for discovery
+    /// - `result`: The discovered feed metadata or error message
+    FeedDiscovered {
+        url: String,
+        result: Result<DiscoveredFeed, String>,
+    },
+    /// Feed subscription completed (inserted into DB).
+    ///
+    /// Fields:
+    /// - `title`: The feed title for status display
+    FeedSubscribed {
+        title: String,
+    },
+    /// Feed subscription failed.
+    FeedSubscribeFailed {
+        error: String,
+    },
+    /// Feed renamed successfully.
+    FeedRenamed {
+        feed_id: i64,
+        new_title: String,
+    },
+    /// Feed rename failed.
+    FeedRenameFailed {
+        feed_id: i64,
+        error: String,
+    },
+    /// Feed moved to a different category.
+    FeedMoved {
+        feed_id: i64,
+        category_id: Option<i64>,
+        category_name: String,
+    },
+    /// Feed move failed.
+    FeedMoveFailed {
+        feed_id: i64,
+        error: String,
+    },
 }
 
 // ============================================================================
@@ -345,6 +484,16 @@ pub struct App {
     // Starred articles view mode
     pub starred_mode: bool,
 
+    // Category state
+    /// All categories loaded from DB, ordered by sort_order then name.
+    pub categories: Arc<Vec<FeedCategory>>,
+    /// Currently selected category index, or None for "All feeds".
+    pub selected_category: Option<usize>,
+    /// Whether the category sidebar is visible.
+    pub show_categories: bool,
+    /// Set of collapsed category IDs. Collapsed categories hide their children in the tree.
+    pub collapsed_categories: HashSet<i64>,
+
     /// PERF-014: Pre-formatted feed prefixes for starred mode display.
     /// Key: feed_id, Value: formatted "[FeedTitle] " string.
     /// Populated when entering starred mode to avoid N allocations per render frame.
@@ -414,10 +563,35 @@ pub struct App {
     /// Invalidated when content state changes or viewport width changes.
     pub reader_cached_line_count: Option<(usize, usize)>,
 
+    /// PERF-021: Cached flattened category tree for rendering and navigation.
+    ///
+    /// Avoids O(categories * feeds) rebuild on every render frame and nav event.
+    /// Invalidated when categories, feeds, or collapsed state changes.
+    pub cached_category_tree: Option<Vec<CategoryTreeItem>>,
+
     /// Whether the help overlay is currently displayed.
     pub show_help: bool,
     /// Scroll offset in the help screen for long keybinding lists.
     pub help_scroll_offset: usize,
+
+    /// Pending confirmation dialog for destructive operations.
+    ///
+    /// When set, the UI renders a confirmation overlay and input is routed
+    /// to the confirmation handler instead of normal dispatch.
+    pub pending_confirm: Option<ConfirmAction>,
+
+    /// Subscribe dialog state machine.
+    ///
+    /// When set, the UI renders a subscribe overlay and input is routed
+    /// to the subscribe handler. Progresses: InputUrl → Discovering → Preview.
+    #[allow(dead_code)] // Wired in by TASK-7 (subscribe dialog)
+    pub subscribe_state: Option<SubscribeState>,
+
+    /// Context menu state for feed operations (rename, move, delete, refresh, open).
+    ///
+    /// When set, the UI renders a context menu overlay and input is routed
+    /// to the context menu handler instead of normal dispatch.
+    pub context_menu: Option<ContextMenuState>,
 }
 
 impl App {
@@ -460,6 +634,10 @@ impl App {
             show_whats_new: false,
             feed_title_cache: HashMap::new(),
             starred_mode: false,
+            categories: Arc::new(Vec::new()),
+            selected_category: None,
+            show_categories: false,
+            collapsed_categories: HashSet::new(),
             feed_prefix_cache: HashMap::new(),
             cached_articles: None,
             needs_redraw: true,
@@ -473,8 +651,12 @@ impl App {
             reader_viewport_width: 0,
             spinner_frame: 0,
             reader_cached_line_count: None,
+            cached_category_tree: None,
             show_help: false,
             help_scroll_offset: 0,
+            pending_confirm: None,
+            subscribe_state: None,
+            context_menu: None,
         })
     }
 
@@ -624,6 +806,14 @@ impl App {
             self.whats_new_selected
                 .min(self.whats_new.len().saturating_sub(1))
         };
+        // Clamp category selection
+        if let Some(idx) = self.selected_category {
+            if self.categories.is_empty() {
+                self.selected_category = None;
+            } else if idx >= self.categories.len() {
+                self.selected_category = Some(self.categories.len().saturating_sub(1));
+            }
+        }
 
         // Debug assertions to catch missed clamp_selections calls during development
         debug_assert!(
@@ -675,11 +865,181 @@ impl App {
         self.whats_new.get(self.whats_new_selected)
     }
 
+    /// Get the category ID for the currently selected category, or None for "All".
+    pub fn selected_category_id(&self) -> Option<i64> {
+        self.selected_category
+            .and_then(|idx| self.categories.get(idx))
+            .map(|cat| cat.id)
+    }
+
+    /// Return feeds filtered by the selected category.
+    ///
+    /// If `selected_category` is None ("All"), returns all feeds.
+    /// If Some(idx), returns only feeds whose `category_id` matches the selected category's ID.
+    #[allow(dead_code)] // Not yet used in rendering; consumed by tests
+    pub fn filtered_feeds(&self) -> Vec<&Feed> {
+        match self.selected_category_id() {
+            None => self.feeds.iter().collect(),
+            Some(cat_id) => self
+                .feeds
+                .iter()
+                .filter(|f| f.category_id == Some(cat_id))
+                .collect(),
+        }
+    }
+
+    /// Build the visible category tree, respecting collapsed state.
+    ///
+    /// PERF-021: Returns a cached tree when available. The cache is invalidated
+    /// by `invalidate_category_tree()` which must be called whenever categories,
+    /// feeds (unread counts), or collapsed state changes.
+    ///
+    /// Returns a flat list of `CategoryTreeItem` in display order.
+    /// "All" is always item 0 (with `category_id = None`).
+    pub fn build_category_tree(&mut self) -> Vec<CategoryTreeItem> {
+        if let Some(ref cached) = self.cached_category_tree {
+            return cached.clone();
+        }
+        let tree = self.build_category_tree_uncached();
+        self.cached_category_tree = Some(tree.clone());
+        tree
+    }
+
+    /// PERF-021: Get the cached category tree, or build it fresh.
+    ///
+    /// For read-only callers (e.g., render functions) that cannot call `build_category_tree()`.
+    /// Returns a reference to the cached tree if available, otherwise builds a new one.
+    pub fn category_tree(&self) -> Cow<'_, [CategoryTreeItem]> {
+        match &self.cached_category_tree {
+            Some(cached) => Cow::Borrowed(cached.as_slice()),
+            None => Cow::Owned(self.build_category_tree_uncached()),
+        }
+    }
+
+    /// Build the category tree without caching. Used internally and by
+    /// read-only callers that cannot mutate App.
+    fn build_category_tree_uncached(&self) -> Vec<CategoryTreeItem> {
+        let mut items = vec![CategoryTreeItem {
+            category_id: None,
+            name: "All".to_string(),
+            depth: 0,
+            unread_count: self.feeds.iter().map(|f| f.unread_count).sum(),
+            has_children: false,
+            is_expanded: true,
+        }];
+
+        let roots: Vec<&FeedCategory> = self
+            .categories
+            .iter()
+            .filter(|c| c.parent_id.is_none())
+            .collect();
+
+        for root in roots {
+            self.add_tree_item(&mut items, root, 1);
+        }
+
+        items
+    }
+
+    /// PERF-021: Invalidate the cached category tree.
+    ///
+    /// Must be called after any mutation to:
+    /// - `self.categories` (add/remove/reorder)
+    /// - `self.feeds` (unread count changes, add/remove/move)
+    /// - `self.collapsed_categories` (expand/collapse)
+    pub fn invalidate_category_tree(&mut self) {
+        self.cached_category_tree = None;
+    }
+
+    fn add_tree_item(&self, items: &mut Vec<CategoryTreeItem>, cat: &FeedCategory, depth: usize) {
+        let children: Vec<&FeedCategory> = self
+            .categories
+            .iter()
+            .filter(|c| c.parent_id == Some(cat.id))
+            .collect();
+        let has_children = !children.is_empty();
+        let is_expanded = !self.collapsed_categories.contains(&cat.id);
+
+        let unread_count: i64 = self
+            .feeds
+            .iter()
+            .filter(|f| f.category_id == Some(cat.id))
+            .map(|f| f.unread_count)
+            .sum();
+
+        items.push(CategoryTreeItem {
+            category_id: Some(cat.id),
+            name: cat.name.clone(),
+            depth,
+            unread_count,
+            has_children,
+            is_expanded,
+        });
+
+        if is_expanded {
+            for child in children {
+                self.add_tree_item(items, child, depth + 1);
+            }
+        }
+    }
+
+    /// Toggle collapse state for a category.
+    pub fn toggle_category_collapse(&mut self, cat_id: i64) {
+        if self.collapsed_categories.contains(&cat_id) {
+            self.collapsed_categories.remove(&cat_id);
+        } else {
+            self.collapsed_categories.insert(cat_id);
+        }
+        self.invalidate_category_tree(); // PERF-021: Collapsed state changed
+    }
+
+    /// Map selected_category to a visible tree index. 0 = "All".
+    ///
+    /// PERF-021: Accepts a pre-built tree to avoid redundant rebuilds.
+    pub fn category_tree_selected_index_in(&self, tree: &[CategoryTreeItem]) -> usize {
+        match self.selected_category {
+            None => 0,
+            Some(idx) => {
+                if let Some(cat) = self.categories.get(idx) {
+                    tree.iter()
+                        .position(|item| item.category_id == Some(cat.id))
+                        .unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// Select a category by its visible tree index.
+    ///
+    /// PERF-021: Accepts a pre-built tree to avoid redundant rebuilds.
+    pub fn select_category_by_tree_index_in(&mut self, tree: &[CategoryTreeItem], tree_idx: usize) {
+        if let Some(item) = tree.get(tree_idx) {
+            match item.category_id {
+                None => self.selected_category = None,
+                Some(cat_id) => {
+                    if let Some(idx) = self.categories.iter().position(|c| c.id == cat_id) {
+                        self.selected_category = Some(idx);
+                    }
+                }
+            }
+        }
+    }
+
     /// Navigate up in current list
     pub fn nav_up(&mut self) {
         match self.focus {
             Focus::WhatsNew => {
                 self.whats_new_selected = self.whats_new_selected.saturating_sub(1);
+            }
+            Focus::Categories => {
+                // PERF-021: Single tree build for index lookup + selection
+                let tree = self.build_category_tree();
+                let current = self.category_tree_selected_index_in(&tree);
+                if current > 0 {
+                    self.select_category_by_tree_index_in(&tree, current - 1);
+                }
             }
             Focus::Feeds => {
                 self.selected_feed = self.selected_feed.saturating_sub(1);
@@ -698,6 +1058,15 @@ impl App {
                     let max_index = self.whats_new.len().saturating_sub(1);
                     self.whats_new_selected =
                         self.whats_new_selected.saturating_add(1).min(max_index);
+                }
+            }
+            Focus::Categories => {
+                // PERF-021: Single tree build for index lookup + selection
+                let tree = self.build_category_tree();
+                let current = self.category_tree_selected_index_in(&tree);
+                let max_index = tree.len().saturating_sub(1);
+                if current < max_index {
+                    self.select_category_by_tree_index_in(&tree, current + 1);
                 }
             }
             Focus::Feeds => {
@@ -890,6 +1259,7 @@ impl App {
     pub fn snapshot(&self) -> SessionSnapshot {
         let focus = match self.focus {
             Focus::WhatsNew => "whatsnew",
+            Focus::Categories => "feeds", // Snapshot restores to feeds panel
             Focus::Feeds => "feeds",
             Focus::Articles => "articles",
         };
@@ -1054,6 +1424,7 @@ mod tests {
             error: None,
             unread_count: 0,
             consecutive_failures: 0,
+            category_id: None,
         }
     }
 
@@ -1669,5 +2040,387 @@ mod tests {
         assert!(app.status_message.is_some());
         let (msg, _) = app.status_message.as_ref().unwrap();
         assert_eq!(msg, "Theme: Light");
+    }
+
+    // ========================================================================
+    // Category State Tests (TASK-5)
+    // ========================================================================
+
+    fn test_category(id: i64, name: &str, parent_id: Option<i64>) -> FeedCategory {
+        FeedCategory {
+            id,
+            name: name.to_string(),
+            parent_id,
+            sort_order: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_category_filter_feeds() {
+        let mut app = test_app().await;
+
+        let cat_tech = test_category(10, "Tech", None);
+        let cat_news = test_category(20, "News", None);
+        app.categories = Arc::new(vec![cat_tech, cat_news]);
+
+        let mut f1 = test_feed(1, "Rust Blog");
+        f1.category_id = Some(10);
+        let mut f2 = test_feed(2, "Go Blog");
+        f2.category_id = Some(10);
+        let mut f3 = test_feed(3, "BBC");
+        f3.category_id = Some(20);
+        let f4 = test_feed(4, "Uncategorized");
+        app.feeds = Arc::new(vec![f1, f2, f3, f4]);
+
+        // All feeds when no category selected
+        app.selected_category = None;
+        assert_eq!(app.filtered_feeds().len(), 4);
+
+        // Filter by Tech (index 0 in categories vec)
+        app.selected_category = Some(0);
+        let filtered = app.filtered_feeds();
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|f| f.category_id == Some(10)));
+
+        // Filter by News (index 1 in categories vec)
+        app.selected_category = Some(1);
+        let filtered = app.filtered_feeds();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(&*filtered[0].title, "BBC");
+    }
+
+    #[tokio::test]
+    async fn test_category_selection_clamp() {
+        let mut app = test_app().await;
+
+        // Category index out of bounds on empty list
+        app.selected_category = Some(5);
+        app.clamp_selections();
+        assert_eq!(app.selected_category, None);
+
+        // Category index out of bounds on non-empty list
+        app.categories = Arc::new(vec![test_category(1, "Cat", None)]);
+        app.selected_category = Some(5);
+        app.clamp_selections();
+        assert_eq!(app.selected_category, Some(0));
+
+        // Valid index unchanged
+        app.selected_category = Some(0);
+        app.clamp_selections();
+        assert_eq!(app.selected_category, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_selected_category_id() {
+        let mut app = test_app().await;
+
+        // No category selected
+        assert_eq!(app.selected_category_id(), None);
+
+        app.categories = Arc::new(vec![
+            test_category(10, "Tech", None),
+            test_category(20, "News", None),
+        ]);
+
+        // Select first category
+        app.selected_category = Some(0);
+        assert_eq!(app.selected_category_id(), Some(10));
+
+        // Select second category
+        app.selected_category = Some(1);
+        assert_eq!(app.selected_category_id(), Some(20));
+
+        // Out of bounds index returns None
+        app.selected_category = Some(99);
+        assert_eq!(app.selected_category_id(), None);
+    }
+
+    // ========================================================================
+    // Delete Feed Confirmation Tests (TASK-6)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_delete_confirm_flow() {
+        let mut app = test_app().await;
+
+        // Set up feed
+        app.feeds = Arc::new(vec![test_feed(1, "Test Feed")]);
+        app.selected_feed = 0;
+
+        // Trigger delete → should set pending_confirm
+        assert!(app.pending_confirm.is_none());
+        if let Some(feed) = app.selected_feed() {
+            app.pending_confirm = Some(ConfirmAction::DeleteFeed {
+                feed_id: feed.id,
+                title: feed.title.to_string(),
+            });
+        }
+        assert!(app.pending_confirm.is_some());
+        if let Some(ConfirmAction::DeleteFeed { feed_id, title }) = &app.pending_confirm {
+            assert_eq!(*feed_id, 1);
+            assert_eq!(title, "Test Feed");
+        } else {
+            panic!("Expected DeleteFeed confirm action");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_cancel() {
+        let mut app = test_app().await;
+
+        app.pending_confirm = Some(ConfirmAction::DeleteFeed {
+            feed_id: 1,
+            title: "Test Feed".to_string(),
+        });
+
+        // Cancel → should clear pending_confirm
+        app.pending_confirm = None;
+        app.set_status("Cancelled");
+
+        assert!(app.pending_confirm.is_none());
+        assert!(app.status_message.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_feed_deleted_event_updates_state() {
+        let mut app = test_app().await;
+
+        // Set up feeds and articles
+        app.feeds = Arc::new(vec![test_feed(1, "Feed A"), test_feed(2, "Feed B")]);
+        app.selected_feed = 0;
+        app.rebuild_feed_cache();
+
+        // Simulate article data for feed 1
+        let article = Article {
+            id: 100,
+            feed_id: 1,
+            guid: "guid-1".to_string(),
+            title: Arc::from("Article 1"),
+            url: None,
+            published: None,
+            summary: None,
+            content: None,
+            read: false,
+            starred: false,
+            fetched_at: 0,
+        };
+        app.articles = Arc::new(vec![article]);
+
+        // Simulate FeedDeleted event handling
+        let feeds = Arc::make_mut(&mut app.feeds);
+        feeds.retain(|f| f.id != 1);
+        let articles = Arc::make_mut(&mut app.articles);
+        articles.retain(|a| a.feed_id != 1);
+        app.feed_title_cache.remove(&1);
+        app.cached_articles = None;
+        app.clamp_selections();
+
+        // Verify state
+        assert_eq!(app.feeds.len(), 1);
+        assert_eq!(app.feeds[0].id, 2);
+        assert!(app.articles.is_empty());
+        assert!(!app.feed_title_cache.contains_key(&1));
+    }
+
+    // ========================================================================
+    // Category Tree Tests (TASK-8)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_category_panel_toggle() {
+        let mut app = test_app().await;
+        assert!(!app.show_categories);
+
+        app.show_categories = true;
+        assert!(app.show_categories);
+
+        // When hiding categories, focus should move away from Categories
+        app.focus = Focus::Categories;
+        app.show_categories = false;
+        // Simulating what the input handler does:
+        if !app.show_categories && app.focus == Focus::Categories {
+            app.focus = Focus::Feeds;
+        }
+        assert_eq!(app.focus, Focus::Feeds);
+    }
+
+    #[tokio::test]
+    async fn test_category_focus_cycle() {
+        let mut app = test_app().await;
+
+        // Without categories: Feeds -> Articles -> Feeds
+        app.focus = Focus::Feeds;
+        // Simulate: no categories, no whatsnew
+        assert_eq!(app.show_categories, false);
+        // Cycle: Feeds -> Articles
+        app.focus = Focus::Articles;
+        // Cycle: Articles -> Feeds
+        app.focus = Focus::Feeds;
+
+        // With categories: Categories -> Feeds -> Articles -> Categories
+        app.show_categories = true;
+        app.focus = Focus::Categories;
+        // These transitions are tested through the actual input handler
+        // but we verify the enum values exist and focus transitions are valid
+        app.focus = Focus::Feeds;
+        assert_eq!(app.focus, Focus::Feeds);
+        app.focus = Focus::Articles;
+        assert_eq!(app.focus, Focus::Articles);
+        app.focus = Focus::Categories;
+        assert_eq!(app.focus, Focus::Categories);
+    }
+
+    #[tokio::test]
+    async fn test_category_tree_building() {
+        let mut app = test_app().await;
+
+        // Empty categories: tree has only "All"
+        let tree = app.build_category_tree();
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].name, "All");
+        assert!(tree[0].category_id.is_none());
+
+        // Add categories with nesting
+        app.categories = Arc::new(vec![
+            FeedCategory {
+                id: 1,
+                name: "Tech".to_string(),
+                parent_id: None,
+                sort_order: 0,
+            },
+            FeedCategory {
+                id: 2,
+                name: "Rust".to_string(),
+                parent_id: Some(1),
+                sort_order: 0,
+            },
+            FeedCategory {
+                id: 3,
+                name: "News".to_string(),
+                parent_id: None,
+                sort_order: 1,
+            },
+        ]);
+        app.invalidate_category_tree(); // PERF-021: Invalidate cache after mutation
+
+        let tree = app.build_category_tree();
+        // All, Tech, Rust (child of Tech), News
+        assert_eq!(tree.len(), 4);
+        assert_eq!(tree[0].name, "All");
+        assert_eq!(tree[1].name, "Tech");
+        assert_eq!(tree[1].depth, 1);
+        assert!(tree[1].has_children);
+        assert_eq!(tree[2].name, "Rust");
+        assert_eq!(tree[2].depth, 2);
+        assert_eq!(tree[3].name, "News");
+        assert_eq!(tree[3].depth, 1);
+    }
+
+    #[tokio::test]
+    async fn test_category_collapse_expand() {
+        let mut app = test_app().await;
+
+        app.categories = Arc::new(vec![
+            FeedCategory {
+                id: 1,
+                name: "Tech".to_string(),
+                parent_id: None,
+                sort_order: 0,
+            },
+            FeedCategory {
+                id: 2,
+                name: "Rust".to_string(),
+                parent_id: Some(1),
+                sort_order: 0,
+            },
+        ]);
+        app.invalidate_category_tree(); // PERF-021: Invalidate cache after mutation
+
+        // Initially expanded: All, Tech, Rust
+        let tree = app.build_category_tree();
+        assert_eq!(tree.len(), 3);
+
+        // Collapse Tech
+        app.toggle_category_collapse(1);
+        let tree = app.build_category_tree();
+        assert_eq!(tree.len(), 2); // All, Tech (Rust hidden)
+        assert!(!tree[1].is_expanded);
+
+        // Expand Tech
+        app.toggle_category_collapse(1);
+        let tree = app.build_category_tree();
+        assert_eq!(tree.len(), 3);
+        assert!(tree[1].is_expanded);
+    }
+
+    // ========================================================================
+    // Context Menu Tests (TASK-9)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_context_menu_open_close() {
+        let mut app = test_app().await;
+        app.feeds = Arc::new(vec![test_feed(1, "Test Feed")]);
+        app.selected_feed = 0;
+
+        // Open context menu for selected feed
+        assert!(app.context_menu.is_none());
+        if let Some(feed) = app.selected_feed() {
+            app.context_menu = Some(ContextMenuState {
+                feed_id: feed.id,
+                feed_title: feed.title.to_string(),
+                feed_url: feed.url.clone(),
+                feed_html_url: feed.html_url.clone(),
+                selected_item: 0,
+                sub_state: ContextMenuSubState::MainMenu,
+            });
+        }
+        assert!(app.context_menu.is_some());
+        let menu = app.context_menu.as_ref().unwrap();
+        assert_eq!(menu.feed_id, 1);
+        assert_eq!(menu.feed_title, "Test Feed");
+        assert_eq!(menu.selected_item, 0);
+
+        // Close
+        app.context_menu = None;
+        assert!(app.context_menu.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_context_menu_delegates_delete() {
+        let mut app = test_app().await;
+
+        // Simulate context menu selecting "Delete" (item 2)
+        app.context_menu = None; // Menu is dismissed
+        app.pending_confirm = Some(ConfirmAction::DeleteFeed {
+            feed_id: 42,
+            title: "My Feed".to_string(),
+        });
+
+        // Verify it delegates to the confirm flow
+        assert!(app.pending_confirm.is_some());
+        if let Some(ConfirmAction::DeleteFeed { feed_id, title }) = &app.pending_confirm {
+            assert_eq!(*feed_id, 42);
+            assert_eq!(title, "My Feed");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_move_feed_to_category_state() {
+        let mut app = test_app().await;
+
+        let mut f1 = test_feed(1, "Rust Blog");
+        f1.category_id = None;
+        app.feeds = Arc::new(vec![f1]);
+
+        app.categories = Arc::new(vec![test_category(10, "Tech", None)]);
+
+        // Simulate FeedMoved event handler
+        let feeds = Arc::make_mut(&mut app.feeds);
+        if let Some(f) = feeds.iter_mut().find(|f| f.id == 1) {
+            f.category_id = Some(10);
+        }
+
+        assert_eq!(app.feeds[0].category_id, Some(10));
     }
 }

@@ -3,7 +3,8 @@
 //! This module processes background task completion events such as
 //! refresh progress, content loading, and star toggle results.
 
-use crate::app::{App, AppEvent, ContentState, Focus, View, WhatsNewEntry};
+#[allow(unused_imports)] // SubscribeState used by TASK-7 subscribe dialog event handling
+use crate::app::{App, AppEvent, ContentState, Focus, SubscribeState, View, WhatsNewEntry};
 use crate::storage::Article;
 use crate::util::strip_control_chars;
 use std::collections::HashMap;
@@ -140,6 +141,64 @@ pub(super) async fn handle_app_event(app: &mut App, event: AppEvent) {
             app.set_status(format!("Export failed: {}", error));
             app.needs_redraw = true;
         }
+        AppEvent::FeedDeleted {
+            feed_id,
+            title,
+            articles_removed,
+        } => {
+            handle_feed_deleted(app, feed_id, &title, articles_removed);
+        }
+        AppEvent::FeedDeleteFailed { feed_id, error } => {
+            tracing::error!(feed_id, error = %error, "Feed deletion failed");
+            app.set_status(format!("Delete failed: {}", error));
+            app.needs_redraw = true;
+        }
+        AppEvent::FeedDiscovered { url, result } => {
+            handle_feed_discovered(app, url, result);
+        }
+        AppEvent::FeedSubscribed { title } => {
+            handle_feed_subscribed(app, title).await;
+        }
+        AppEvent::FeedSubscribeFailed { error } => {
+            tracing::error!(error = %error, "Feed subscription failed");
+            app.set_status(format!("Subscribe failed: {}", error));
+            app.needs_redraw = true;
+        }
+        AppEvent::FeedRenamed { feed_id, new_title } => {
+            tracing::info!(feed_id, new_title = %new_title, "Feed renamed");
+            let feeds = Arc::make_mut(&mut app.feeds);
+            if let Some(feed) = feeds.iter_mut().find(|f| f.id == feed_id) {
+                feed.title = Arc::from(new_title.as_str());
+            }
+            app.sync_feed_cache();
+            app.invalidate_category_tree(); // PERF-021: Feed title changed
+            app.set_status(format!("Renamed to '{}'", new_title));
+            app.needs_redraw = true;
+        }
+        AppEvent::FeedRenameFailed { feed_id, error } => {
+            tracing::error!(feed_id, error = %error, "Feed rename failed");
+            app.set_status(format!("Rename failed: {}", error));
+            app.needs_redraw = true;
+        }
+        AppEvent::FeedMoved {
+            feed_id,
+            category_id,
+            category_name,
+        } => {
+            tracing::info!(feed_id, category_id = ?category_id, "Feed moved to category");
+            let feeds = Arc::make_mut(&mut app.feeds);
+            if let Some(feed) = feeds.iter_mut().find(|f| f.id == feed_id) {
+                feed.category_id = category_id;
+            }
+            app.invalidate_category_tree(); // PERF-021: Feed category membership changed
+            app.set_status(format!("Moved to '{}'", category_name));
+            app.needs_redraw = true;
+        }
+        AppEvent::FeedMoveFailed { feed_id, error } => {
+            tracing::error!(feed_id, error = %error, "Feed move failed");
+            app.set_status(format!("Move failed: {}", error));
+            app.needs_redraw = true;
+        }
     }
 }
 
@@ -269,6 +328,8 @@ async fn handle_refresh_complete(app: &mut App, results: Vec<crate::app::FetchRe
         // BUG-011: Sync feed cache to remove stale entries from deleted feeds
         // This also updates all current feed entries
         app.sync_feed_cache();
+
+        app.invalidate_category_tree(); // PERF-021: Feeds replaced with new unread counts
 
         // DATA-001: Reload current feed's articles to ensure in-memory matches DB
         // This fixes data divergence if user modified articles during refresh
@@ -538,6 +599,7 @@ fn handle_bulk_mark_read_complete(app: &mut App, feed_id: Option<i64>, count: u6
         }
     }
     app.clamp_selections();
+    app.invalidate_category_tree(); // PERF-021: Unread counts changed
     app.needs_redraw = true;
     app.set_status(format!("Marked {} articles read", count));
 }
@@ -546,5 +608,101 @@ fn handle_bulk_mark_read_complete(app: &mut App, feed_id: Option<i64>, count: u6
 fn handle_bulk_mark_read_failed(app: &mut App, feed_id: Option<i64>, error: String) {
     tracing::error!(feed_id = ?feed_id, error = %error, "Bulk mark-read failed");
     app.set_status(format!("Failed to mark articles read: {}", error));
+    app.needs_redraw = true;
+}
+
+/// Handle feed deletion completion event.
+///
+/// Removes the feed from in-memory state, cleans up articles belonging to
+/// the deleted feed, invalidates caches, and clamps selections.
+fn handle_feed_deleted(app: &mut App, feed_id: i64, title: &str, articles_removed: usize) {
+    tracing::info!(feed_id, title = %title, articles_removed, "Feed deleted");
+
+    // Remove feed from in-memory list
+    let feeds = Arc::make_mut(&mut app.feeds);
+    feeds.retain(|f| f.id != feed_id);
+
+    // Remove articles belonging to the deleted feed
+    let articles = Arc::make_mut(&mut app.articles);
+    articles.retain(|a| a.feed_id != feed_id);
+
+    // Remove from feed title cache
+    app.feed_title_cache.remove(&feed_id);
+
+    // Invalidate article cache (may contain stale references)
+    app.cached_articles = None;
+
+    // Clear pending confirm if it was for this feed (edge case: confirm still pending)
+    if let Some(crate::app::ConfirmAction::DeleteFeed {
+        feed_id: pending_id,
+        ..
+    }) = &app.pending_confirm
+    {
+        if *pending_id == feed_id {
+            app.pending_confirm = None;
+        }
+    }
+
+    // BUG-004: Clamp immediately after list mutation to prevent out-of-bounds access
+    app.clamp_selections();
+    app.invalidate_category_tree(); // PERF-021: Feed removed
+
+    app.set_status(format!(
+        "Deleted '{}' ({} articles removed)",
+        title, articles_removed
+    ));
+    app.needs_redraw = true;
+}
+
+/// Handle feed discovery result from subscribe dialog.
+fn handle_feed_discovered(
+    app: &mut App,
+    url: String,
+    result: Result<crate::feed::DiscoveredFeed, String>,
+) {
+    // Only process if still in Discovering state for this URL
+    let is_discovering = matches!(
+        &app.subscribe_state,
+        Some(SubscribeState::Discovering { url: u }) if *u == url
+    );
+    if !is_discovering {
+        tracing::debug!(url = %url, "Ignoring discovery result (dialog cancelled or state changed)");
+        return;
+    }
+
+    match result {
+        Ok(feed) => {
+            // Check if already subscribed
+            if app.feeds.iter().any(|f| f.url == feed.feed_url) {
+                app.subscribe_state = None;
+                app.set_status(format!("Already subscribed to {}", feed.title));
+            } else {
+                app.subscribe_state = Some(SubscribeState::Preview { feed });
+            }
+        }
+        Err(e) => {
+            // Return to URL input so user can fix and retry
+            app.subscribe_state = Some(SubscribeState::InputUrl { input: url });
+            app.set_status(format!("Discovery failed: {}", e));
+        }
+    }
+    app.needs_redraw = true;
+}
+
+/// Handle feed subscription completion.
+///
+/// Reloads feeds from DB and triggers a single-feed refresh to populate articles.
+async fn handle_feed_subscribed(app: &mut App, title: String) {
+    tracing::info!(title = %title, "Feed subscribed");
+    app.set_status(format!("Subscribed to {}", title));
+
+    // Reload feeds from DB to include the new feed
+    if let Ok(feeds) = app.db.get_feeds_with_unread_counts().await {
+        app.feeds = Arc::new(feeds);
+        app.rebuild_feed_cache();
+        app.clamp_selections();
+        app.invalidate_category_tree(); // PERF-021: New feed added
+    }
+
     app.needs_redraw = true;
 }
