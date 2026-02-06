@@ -3,7 +3,7 @@ use crate::util::{display_width, truncate_to_width};
 use chrono::{DateTime, Utc};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState},
     Frame,
@@ -59,6 +59,14 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
     let is_focused = app.focus == Focus::Articles;
 
+    // PERF-021: Hoist style lookups out of per-item loop
+    let style_star = app.style("article_star");
+    let style_feed_prefix = app.style("article_feed_prefix");
+    let style_selected = app.style("article_selected");
+    let style_title = app.style("article_title");
+    let style_read = app.style("article_read");
+    let style_date = app.style("article_date");
+
     let items: Vec<ListItem> = if app.articles.is_empty() {
         // EDGE-006: Contextual empty message
         if app.search_mode && !app.search_input.is_empty() {
@@ -90,15 +98,12 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
             // Star indicator
             if article.starred {
-                spans.push(Span::styled("★ ", Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled("★ ", style_star));
             }
 
             // Feed name prefix in starred mode
             let feed_prefix_width = if let Some(prefix) = feed_prefix {
-                spans.push(Span::styled(
-                    prefix.as_str(),
-                    Style::default().fg(Color::Cyan),
-                ));
+                spans.push(Span::styled(prefix.as_str(), style_feed_prefix));
                 display_width(prefix)
             } else {
                 0
@@ -106,11 +111,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
             // Title style based on read status and selection
             let title_style = if i == app.selected_article {
-                Style::default().bg(Color::DarkGray).fg(Color::White)
+                style_selected
             } else if !article.read {
-                Style::default().add_modifier(Modifier::BOLD)
+                style_title
             } else {
-                Style::default().fg(Color::Gray)
+                style_read
             };
 
             // Calculate widths for right-alignment
@@ -140,7 +145,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 let padding = available_width.saturating_sub(used_width);
                 spans.push(Span::styled(
                     format!("{:>width$}", time_str, width = padding + time_width),
-                    Style::default().fg(Color::DarkGray),
+                    style_date,
                 ));
             }
 
@@ -150,9 +155,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let border_style = if is_focused {
-        Style::default().fg(Color::Cyan)
+        app.style("panel_border_focused")
     } else {
-        Style::default()
+        app.style("panel_border")
     };
 
     let title = if app.search_mode {

@@ -1,9 +1,9 @@
 use crate::app::{App, ContentState};
+use crate::theme::StyleMap;
 use crate::ui::articles::format_relative_time;
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
@@ -44,13 +44,10 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let time_str = format_relative_time(article.published);
 
     let header = vec![
-        Line::from(Span::styled(
-            &*article.title,
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
+        Line::from(Span::styled(&*article.title, app.style("reader_heading"))),
         Line::from(Span::styled(
             format!("{} • {}", feed_name, time_str),
-            Style::default().fg(Color::DarkGray),
+            app.style("reader_metadata"),
         )),
         Line::from(""), // Blank line
     ];
@@ -77,14 +74,14 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
             let mut lines = vec![
                 Line::from(Span::styled(
                     format!("Failed to load content: {}", error),
-                    Style::default().fg(Color::Red),
+                    app.style("reader_error"),
                 )),
                 Line::from(""),
             ];
             if let Some(summary) = fallback {
                 lines.push(Line::from(Span::styled(
                     "Showing summary:",
-                    Style::default().fg(Color::Yellow),
+                    app.style("reader_fallback"),
                 )));
                 lines.push(Line::from(""));
                 lines.extend(summary.lines().map(|l| Line::from(l.to_string())));
@@ -96,22 +93,20 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     // Build text by chaining iterators - avoids intermediate Vec allocation
     let text = Text::from_iter(header.into_iter().chain(content_lines.iter().cloned()));
 
-    // Note: ratatui's scroll offset is u16, limiting max scroll to 65535 lines.
-    // For articles exceeding this (extremely rare), content beyond line 65535
-    // is inaccessible via scrolling. This is an acceptable limitation given
-    // typical article lengths.
-    const MAX_SCROLL: usize = u16::MAX as usize;
+    // scroll_offset is guaranteed <= u16::MAX by clamp_scroll() (see app::MAX_SCROLL)
     let paragraph = Paragraph::new(text)
         .block(Block::default().borders(Borders::ALL).title("Article"))
         .wrap(Wrap { trim: false })
-        .scroll((app.scroll_offset.min(MAX_SCROLL) as u16, 0));
+        .scroll((app.scroll_offset as u16, 0));
 
     f.render_widget(paragraph, area);
 }
 
 /// Convert markdown to styled ratatui Lines.
 /// Returns owned Lines for caching (PERF-004).
-pub fn render_markdown(md: &str) -> Vec<Line<'static>> {
+///
+/// Accepts a `StyleMap` to resolve semantic roles for markdown elements.
+pub fn render_markdown(md: &str, styles: &StyleMap) -> Vec<Line<'static>> {
     let parser = Parser::new(md);
     // Estimate: markdown lines roughly map to output lines
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(md.lines().count());
@@ -166,22 +161,20 @@ pub fn render_markdown(md: &str) -> Vec<Line<'static>> {
             Event::Start(Tag::Image { dest_url, .. }) => {
                 current_spans.push(Span::styled(
                     format!("[Image: {}]", dest_url),
-                    Style::default().fg(Color::Blue),
+                    styles.resolve("reader_image"),
                 ));
             }
             Event::Text(text) => {
                 let style = if in_code_block {
-                    Style::default().fg(Color::Yellow).bg(Color::Black)
+                    styles.resolve("reader_code_block")
                 } else if in_heading {
-                    Style::default()
-                        .add_modifier(Modifier::BOLD)
-                        .fg(Color::Cyan)
+                    styles.resolve("reader_heading")
                 } else if in_strong {
-                    Style::default().add_modifier(Modifier::BOLD)
+                    styles.resolve("reader_strong")
                 } else if in_emphasis {
-                    Style::default().add_modifier(Modifier::ITALIC)
+                    styles.resolve("reader_emphasis")
                 } else {
-                    Style::default()
+                    styles.resolve("reader_body")
                 };
                 // PERF-011: CowStr::into_string() is O(1) for Boxed variant (no allocation),
                 // vs .to_string() which always allocates
@@ -190,7 +183,7 @@ pub fn render_markdown(md: &str) -> Vec<Line<'static>> {
             Event::Code(code) => {
                 current_spans.push(Span::styled(
                     format!("`{}`", code),
-                    Style::default().fg(Color::Yellow),
+                    styles.resolve("reader_inline_code"),
                 ));
             }
             Event::SoftBreak => {
@@ -216,53 +209,58 @@ pub fn render_markdown(md: &str) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::ThemeVariant;
+
+    fn test_styles() -> StyleMap {
+        StyleMap::from_palette(&ThemeVariant::Dark.palette())
+    }
 
     #[test]
     fn test_render_plain_text() {
-        let lines = render_markdown("Hello world");
+        let lines = render_markdown("Hello world", &test_styles());
         assert!(!lines.is_empty());
     }
 
     #[test]
     fn test_render_heading() {
-        let lines = render_markdown("# Heading 1\n\n## Heading 2");
+        let lines = render_markdown("# Heading 1\n\n## Heading 2", &test_styles());
         assert!(!lines.is_empty());
     }
 
     #[test]
     fn test_render_bold() {
-        let lines = render_markdown("This is **bold** text");
+        let lines = render_markdown("This is **bold** text", &test_styles());
         assert!(!lines.is_empty());
     }
 
     #[test]
     fn test_render_italic() {
-        let lines = render_markdown("This is *italic* text");
+        let lines = render_markdown("This is *italic* text", &test_styles());
         assert!(!lines.is_empty());
     }
 
     #[test]
     fn test_render_code_block() {
-        let lines = render_markdown("```\ncode block\n```");
+        let lines = render_markdown("```\ncode block\n```", &test_styles());
         assert!(!lines.is_empty());
     }
 
     #[test]
     fn test_render_link() {
-        let lines = render_markdown("[link text](https://example.com)");
+        let lines = render_markdown("[link text](https://example.com)", &test_styles());
         assert!(!lines.is_empty());
     }
 
     #[test]
     fn test_render_empty() {
-        let lines = render_markdown("");
+        let lines = render_markdown("", &test_styles());
         // Should not panic - empty input is valid
         assert!(lines.is_empty());
     }
 
     #[test]
     fn test_render_unicode() {
-        let lines = render_markdown("Hello 世界 🌍");
+        let lines = render_markdown("Hello 世界 🌍", &test_styles());
         assert!(!lines.is_empty());
     }
 }

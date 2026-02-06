@@ -2,7 +2,7 @@ use super::articles::format_relative_time;
 use crate::app::{App, Focus};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState},
     Frame,
@@ -35,6 +35,12 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
     let is_focused = app.focus == Focus::Feeds;
 
+    // PERF-021: Hoist style lookups out of per-item loop
+    let style_selected = app.style("feed_selected");
+    let style_unread = app.style("feed_unread");
+    let style_normal = app.style("feed_normal");
+    let style_error = app.style("feed_error");
+
     let items: Vec<ListItem> = if app.feeds.is_empty() {
         vec![ListItem::new("No feeds loaded")]
     } else {
@@ -44,11 +50,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             let time_str = format_relative_time(feed.last_fetched);
 
             let style = if i == app.selected_feed {
-                Style::default().bg(Color::DarkGray).fg(Color::White)
+                style_selected
             } else if feed.unread_count > 0 {
-                Style::default().add_modifier(Modifier::BOLD)
+                style_unread
             } else {
-                Style::default()
+                style_normal
             };
 
             // Pre-allocate spans: error indicator (optional) + title + count (optional) + time (optional)
@@ -56,7 +62,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
             // Error indicator if present
             if feed.error.is_some() {
-                spans.push(Span::styled("⚠ ", Style::default().fg(Color::Red)));
+                spans.push(Span::styled("⚠ ", style_error));
             }
 
             // Title span (borrow from feed.title, no allocation)
@@ -79,9 +85,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let border_style = if is_focused {
-        Style::default().fg(Color::Cyan)
+        app.style("panel_border_focused")
     } else {
-        Style::default()
+        app.style("panel_border")
     };
 
     let title = format!("Feeds ({})", app.feeds.len());

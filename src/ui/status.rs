@@ -1,10 +1,5 @@
 use crate::app::{App, View};
-use ratatui::{
-    layout::Rect,
-    style::{Color, Style},
-    widgets::Paragraph,
-    Frame,
-};
+use ratatui::{layout::Rect, widgets::Paragraph, Frame};
 use std::borrow::Cow;
 
 /// Render the status bar
@@ -20,8 +15,8 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         // Dynamic content requires allocation
         Cow::Owned(format!("Refreshing... {}/{} feeds", done, total))
     } else if let Some((msg, _)) = &app.status_message {
-        // Borrow existing status message instead of cloning
-        Cow::Borrowed(msg.as_str())
+        // P-8: Borrow from Cow — zero-copy for both static and owned messages
+        Cow::Borrowed(msg.as_ref())
     } else {
         // Static keybinding hints - zero allocation
         match app.view {
@@ -38,8 +33,6 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         }
     };
 
-    let style = Style::default().bg(Color::DarkGray).fg(Color::White);
-
-    let paragraph = Paragraph::new(text).style(style);
+    let paragraph = Paragraph::new(text).style(app.style("status_bar"));
     f.render_widget(paragraph, area);
 }

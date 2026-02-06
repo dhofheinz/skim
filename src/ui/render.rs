@@ -10,7 +10,7 @@ use ratatui::{
     Frame,
 };
 
-use super::{articles, feeds, reader, status, whatsnew};
+use super::{articles, feeds, help, reader, status, whatsnew};
 
 /// Minimum terminal dimensions required for normal operation.
 pub(super) const MIN_WIDTH: u16 = 60;
@@ -49,6 +49,11 @@ pub(super) fn render(f: &mut Frame, app: &mut App) {
         View::Browse => render_browse(f, app),
         View::Reader => render_reader(f, app),
     }
+
+    // Render help overlay on top of any view when active
+    if app.show_help {
+        help::render(f, app);
+    }
 }
 
 /// Render the browse view (feeds + articles panels).
@@ -56,7 +61,8 @@ fn render_browse(f: &mut Frame, app: &App) {
     // Layout depends on whether What's New panel is visible
     if app.show_whats_new && !app.whats_new.is_empty() {
         // Three rows: What's New (dynamic height), main panels, status bar
-        let whats_new_height = (app.whats_new.len() as u16 + 2).min(10); // +2 for border, max 10 lines
+        // P-10/I-3: Clamp before cast to prevent u16 overflow; .min(8)+2 caps at 10
+        let whats_new_height = app.whats_new.len().min(8) as u16 + 2;
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)

@@ -3,7 +3,7 @@ use crate::ui::articles::format_relative_time;
 use crate::util::{display_width, truncate_to_width};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState},
     Frame,
@@ -19,34 +19,37 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
     let is_focused = app.focus == Focus::WhatsNew;
 
+    // PERF-021: Hoist style lookups out of per-item loop
+    let style_selected = app.style("whatsnew_selected");
+    let style_title = app.style("whatsnew_title");
+    let style_feed_prefix = app.style("article_feed_prefix");
+    let style_date = app.style("article_date");
+
     let items: Vec<ListItem> = app
         .whats_new
         .iter()
         .enumerate()
-        .map(|(i, (feed_title, article))| {
-            let time_str = format_relative_time(article.published);
+        .map(|(i, entry)| {
+            let time_str = format_relative_time(entry.published);
 
             // Pre-allocate spans: feed name, title, time
             let mut spans = Vec::with_capacity(3);
 
             // Article title
             let title_style = if i == app.whats_new_selected {
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
+                style_selected
             } else {
-                Style::default().add_modifier(Modifier::BOLD)
+                style_title
             };
 
             // Calculate widths for right-alignment
             // Format feed prefix once, reuse for width calculation and span
             let available_width = area.width.saturating_sub(2) as usize;
-            let feed_prefix = format!("[{}] ", feed_title);
+            let feed_prefix = format!("[{}] ", entry.feed_title);
             let feed_width = display_width(&feed_prefix);
 
             // Feed name in brackets (move ownership of pre-formatted string)
-            spans.push(Span::styled(feed_prefix, Style::default().fg(Color::Cyan)));
+            spans.push(Span::styled(feed_prefix, style_feed_prefix));
             let time_width = display_width(&time_str);
             let min_padding = 2;
 
@@ -57,7 +60,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 .saturating_sub(min_padding);
 
             // SAFE - character-aware truncation using unicode-width
-            let title = truncate_to_width(&article.title, max_title_len);
+            let title = truncate_to_width(&entry.title, max_title_len);
             let title_width = display_width(&title);
 
             spans.push(Span::styled(title, title_style));
@@ -68,7 +71,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 let padding = available_width.saturating_sub(used_width);
                 spans.push(Span::styled(
                     format!("{:>width$}", time_str, width = padding + time_width),
-                    Style::default().fg(Color::DarkGray),
+                    style_date,
                 ));
             }
 
@@ -77,9 +80,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let border_style = if is_focused {
-        Style::default().fg(Color::Yellow)
+        app.style("whatsnew_border_focused")
     } else {
-        Style::default().fg(Color::DarkGray)
+        app.style("whatsnew_border_unfocused")
     };
 
     let title = format!(
