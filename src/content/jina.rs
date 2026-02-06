@@ -1,10 +1,12 @@
 use crate::util::validate_url;
 use futures::StreamExt;
+use lru::LruCache;
 use secrecy::{ExposeSecret, SecretString};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::num::NonZeroUsize;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 static JINA_API_KEY: OnceLock<Option<SecretString>> = OnceLock::new();
 
@@ -16,19 +18,59 @@ fn get_jina_api_key() -> Option<&'static SecretString> {
 
 const MAX_CONTENT_SIZE: usize = 5 * 1024 * 1024; // 5MB
 
-static LAST_REQUEST_MS: AtomicU64 = AtomicU64::new(0);
-const MIN_REQUEST_INTERVAL_MS: u64 = 100; // 10 requests/sec max
-const MAX_COLLISIONS: u64 = 20; // Safety valve for rate limiter collision loop
+static RATE_LIMITER: OnceLock<Mutex<Instant>> = OnceLock::new();
+const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
 
-// BUG-012: Use monotonic clock for rate limiting to prevent issues with
-// system time jumps (NTP corrections, VM resume, daylight saving, etc.)
-static START_INSTANT: OnceLock<Instant> = OnceLock::new();
+/// Acquire a rate-limited slot. Uses a mutex for fair FIFO ordering
+/// instead of atomic spin-loop. 10 requests/sec max.
+async fn acquire_rate_slot() {
+    let lock = RATE_LIMITER.get_or_init(|| Mutex::new(Instant::now() - MIN_REQUEST_INTERVAL));
+    let mut last_request = lock.lock().await;
+    let elapsed = last_request.elapsed();
+    if elapsed < MIN_REQUEST_INTERVAL {
+        tokio::time::sleep(MIN_REQUEST_INTERVAL - elapsed).await;
+    }
+    *last_request = Instant::now();
+}
 
-/// Returns monotonic milliseconds since process start.
-/// Unlike SystemTime, this never goes backward regardless of clock adjustments.
-fn monotonic_ms() -> u64 {
-    let start = START_INSTANT.get_or_init(Instant::now);
-    start.elapsed().as_millis() as u64
+/// PERF-012: Cache which CSS selector strategy works for each domain.
+/// Avoids wasting 2-3 extra requests on sites where we already know the answer.
+#[derive(Clone, Copy, Debug)]
+enum SelectorStrategy {
+    Semantic,
+    Fallback,
+    None,
+}
+
+static SELECTOR_CACHE: OnceLock<Mutex<LruCache<String, (SelectorStrategy, Instant)>>> =
+    OnceLock::new();
+const MAX_SELECTOR_CACHE: usize = 1000;
+const SELECTOR_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 3600); // 7 days
+
+fn get_selector_cache() -> &'static Mutex<LruCache<String, (SelectorStrategy, Instant)>> {
+    SELECTOR_CACHE.get_or_init(|| {
+        Mutex::new(LruCache::new(
+            NonZeroUsize::new(MAX_SELECTOR_CACHE).unwrap(),
+        ))
+    })
+}
+
+async fn cache_selector(domain: &str, strategy: SelectorStrategy) {
+    let mut cache = get_selector_cache().lock().await;
+    cache.put(domain.to_string(), (strategy, Instant::now()));
+}
+
+async fn get_cached_selector(domain: &str) -> Option<SelectorStrategy> {
+    let mut cache = get_selector_cache().lock().await;
+    match cache.get(domain) {
+        Some((strategy, created)) if created.elapsed() < SELECTOR_CACHE_TTL => Some(*strategy),
+        Some(_) => {
+            // Expired — remove and return miss
+            cache.pop(domain);
+            None
+        }
+        None => None,
+    }
 }
 
 /// CSS selectors targeting main article content across common blog platforms.
@@ -82,61 +124,8 @@ pub async fn fetch_content(
     url: &str,
     base_url: Option<&str>,
 ) -> Result<String, ContentError> {
-    // Rate limiting: 10 requests/sec max
-    // Use compare_exchange to atomically claim a time slot, avoiding TOCTOU race
-    // BUG-012: Use monotonic clock to avoid issues with system time changes
-    // BUG-013: Add timeout budget to prevent excessive waiting in high-concurrency scenarios
-    let mut collision_count: u64 = 0;
-    let rate_limit_start = Instant::now();
-    const RATE_LIMIT_TIMEOUT: Duration = Duration::from_secs(5);
-    loop {
-        // BUG-013: Check total time budget first to prevent excessive wait in pathological cases
-        if rate_limit_start.elapsed() > RATE_LIMIT_TIMEOUT {
-            tracing::debug!(
-                elapsed_ms = rate_limit_start.elapsed().as_millis(),
-                collisions = collision_count,
-                "Rate limiter timeout budget exceeded, proceeding"
-            );
-            break;
-        }
-
-        let now = monotonic_ms();
-        let last = LAST_REQUEST_MS.load(Ordering::Acquire);
-        let next_allowed = last.saturating_add(MIN_REQUEST_INTERVAL_MS);
-
-        if now >= next_allowed {
-            // Try to claim this slot atomically
-            match LAST_REQUEST_MS.compare_exchange(last, now, Ordering::Release, Ordering::Relaxed)
-            {
-                Ok(_) => break, // Successfully claimed the slot
-                Err(_) => {
-                    // Another thread won, apply backoff to avoid busy-waiting
-                    collision_count += 1;
-
-                    // Safety valve: if too many collisions, proceed anyway
-                    if collision_count >= MAX_COLLISIONS {
-                        tracing::warn!(
-                            collisions = collision_count,
-                            "Rate limiter max collisions reached, proceeding without slot"
-                        );
-                        break;
-                    }
-
-                    if collision_count > 1 {
-                        // Exponential backoff: 100us, 200us, 400us, 800us... (capped at 6.4ms)
-                        let backoff_us = 100 * (1u64 << collision_count.min(6));
-                        tokio::time::sleep(Duration::from_micros(backoff_us)).await;
-                    }
-                    continue;
-                }
-            }
-        } else {
-            // Need to wait before we can claim a slot
-            // BUG-011 fix: Ensure minimum 1ms sleep to prevent spin-wait on time drift
-            let wait_ms = next_allowed.saturating_sub(now).max(1);
-            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-        }
-    }
+    // Rate limiting: 10 requests/sec max via fair FIFO mutex
+    acquire_rate_slot().await;
 
     // SEC-001: Validate URL before use to prevent SSRF attacks
     let parsed_url = validate_url(url).map_err(|_| ContentError::InvalidUrl)?;
@@ -144,15 +133,28 @@ pub async fn fetch_content(
     let base = base_url.unwrap_or("https://r.jina.ai");
 
     // SEC-002: Enforce HTTPS for base URL to prevent API key exposure
-    // Allow HTTP only for localhost/127.0.0.1 (testing purposes)
-    if !base.starts_with("https://") {
-        let is_localhost =
-            base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
-        if !is_localhost {
-            tracing::error!(base_url = %base, "Rejecting non-HTTPS base URL (HTTPS required except for localhost)");
+    // Allow HTTP only for localhost/127.0.0.1/[::1] (testing purposes)
+    // Uses url::Url::parse() to prevent SSRF bypasses via shorthand IPs,
+    // IPv6 loopback, host confusion (e.g. 127.0.0.1.attacker.com), or hex/octal encodings
+    let parsed_base = url::Url::parse(base).map_err(|_| ContentError::InsecureBaseUrl)?;
+    match parsed_base.scheme() {
+        "https" => {} // OK
+        "http" => {
+            let is_localhost = match parsed_base.host() {
+                Some(url::Host::Domain("localhost")) => true,
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                _ => false,
+            };
+            if !is_localhost {
+                tracing::error!(base_url = %base, "Rejecting non-HTTPS base URL");
+                return Err(ContentError::InsecureBaseUrl);
+            }
+            tracing::warn!(base_url = %base, "Using non-HTTPS Jina base URL (localhost only)");
+        }
+        _ => {
             return Err(ContentError::InsecureBaseUrl);
         }
-        tracing::warn!(base_url = %base, "Using non-HTTPS Jina base URL (localhost only)");
     }
 
     if base_url.is_some() {
@@ -160,6 +162,31 @@ pub async fn fetch_content(
     }
 
     let jina_url = format!("{}/{}", base, parsed_url.as_str());
+
+    // PERF-012: Extract domain for selector cache lookup
+    let domain = parsed_url.host_str().unwrap_or("").to_string();
+
+    // Check cache for a previously successful strategy (with TTL expiry)
+    let cached_strategy = get_cached_selector(&domain).await;
+
+    // If we have a cached strategy, try it first
+    if let Some(strategy) = cached_strategy {
+        let selector = match strategy {
+            SelectorStrategy::Semantic => Some(TARGET_SELECTORS),
+            SelectorStrategy::Fallback => Some(FALLBACK_SELECTOR),
+            SelectorStrategy::None => Option::<&str>::None,
+        };
+        tracing::debug!(?strategy, %domain, "Using cached selector strategy");
+        match fetch_with_retry(client, &jina_url, selector).await {
+            Ok(content) if content.len() >= MIN_CONTENT_LEN => {
+                return Ok(strip_boilerplate(&content));
+            }
+            Ok(_) | Err(ContentError::HttpStatus(422)) => {
+                tracing::debug!(?strategy, %domain, "Cached strategy failed, falling through to full chain");
+            }
+            Err(e) => return Err(e),
+        }
+    }
 
     // Priority chain for selector strategies:
     // 1. Semantic selectors (article, .entry-content, etc.)
@@ -170,6 +197,7 @@ pub async fn fetch_content(
     let content: Option<()> =
         match fetch_with_retry(client, &jina_url, Some(TARGET_SELECTORS)).await {
             Ok(content) if content.len() >= MIN_CONTENT_LEN => {
+                cache_selector(&domain, SelectorStrategy::Semantic).await;
                 return Ok(strip_boilerplate(&content));
             }
             Ok(content) => {
@@ -191,6 +219,7 @@ pub async fn fetch_content(
     if content.is_none() {
         match fetch_with_retry(client, &jina_url, Some(FALLBACK_SELECTOR)).await {
             Ok(content) if content.len() >= MIN_CONTENT_LEN => {
+                cache_selector(&domain, SelectorStrategy::Fallback).await;
                 return Ok(strip_boilerplate(&content));
             }
             Ok(content) => {
@@ -208,6 +237,7 @@ pub async fn fetch_content(
 
     // Final attempt: no selector, let jina.ai do full page extraction
     let content = fetch_with_retry(client, &jina_url, None).await?;
+    cache_selector(&domain, SelectorStrategy::None).await;
     Ok(strip_boilerplate(&content))
 }
 
@@ -259,7 +289,13 @@ async fn fetch_with_selector(
     if let Some(key) = get_jina_api_key() {
         if is_official_jina {
             tracing::trace!("Jina API authentication configured");
-            request = request.header("Authorization", format!("Bearer {}", key.expose_secret()));
+            // SEC-004: Mark Authorization header as sensitive to prevent API key
+            // leakage in reqwest debug/trace logging output
+            let mut auth_value =
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", key.expose_secret()))
+                    .expect("API key contains invalid header characters");
+            auth_value.set_sensitive(true);
+            request = request.header("Authorization", auth_value);
         } else {
             tracing::debug!("Skipping API key for non-official Jina URL (custom base_url in use)");
         }
@@ -579,6 +615,40 @@ mod tests {
         .await;
 
         // Should fail with network error, not InsecureBaseUrl
+        assert!(!matches!(result, Err(ContentError::InsecureBaseUrl)));
+    }
+
+    #[tokio::test]
+    async fn test_host_confusion_base_url_rejected() {
+        let client = reqwest::Client::new();
+        // SEC-002: 127.0.0.1.attacker.com parses as a domain, not a loopback IP
+        let result = fetch_content(
+            &client,
+            "https://example.com/article",
+            Some("http://127.0.0.1.attacker.com"),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ContentError::InsecureBaseUrl)));
+    }
+
+    #[tokio::test]
+    async fn test_ipv6_loopback_base_url_allowed() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(".*"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("content"))
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        // http://[::1]:PORT should be accepted as localhost
+        let port = mock_server.address().port();
+        let base = format!("http://[::1]:{port}");
+        let result = fetch_content(&client, "https://example.com/article", Some(&base)).await;
+
+        // Should NOT be rejected as InsecureBaseUrl (may fail for other reasons
+        // if the system doesn't support IPv6, but the SSRF check must pass)
         assert!(!matches!(result, Err(ContentError::InsecureBaseUrl)));
     }
 
