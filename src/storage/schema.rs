@@ -27,6 +27,34 @@ impl Database {
     /// Returns `DatabaseError::Other` for other database errors.
     pub async fn open(path: &str) -> Result<Self, DatabaseError> {
         let url = format!("sqlite:{}?mode=rwc", path);
+
+        // SEC-010: Set database file permissions BEFORE pool creation
+        // Ensures no window where the file exists with default umask permissions
+        #[cfg(unix)]
+        if path != ":memory:" {
+            use std::os::unix::fs::PermissionsExt;
+            let db_path = std::path::Path::new(path);
+            if db_path.exists() {
+                let perms = std::fs::Permissions::from_mode(0o600);
+                if let Err(e) = std::fs::set_permissions(path, perms) {
+                    tracing::warn!(path = %path, error = %e, "SEC-010: Failed to set database file permissions");
+                }
+            } else if let Some(parent) = db_path.parent() {
+                if parent.exists() {
+                    // SEC-010/S-6: Pre-create DB file with mode(0o600) atomically
+                    // Using OpenOptionsExt::mode() sets permissions at creation time,
+                    // eliminating the TOCTOU window between create and chmod.
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let _file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(db_path)
+                        .ok(); // If creation fails, SQLite will report the error at connect_with.
+                }
+            }
+        }
+
         // Configure SQLite connection options with busy_timeout pragma.
         // busy_timeout=5000: SQLite waits up to 5 seconds for locks to release before returning SQLITE_BUSY.
         // This handles transient lock contention (e.g., concurrent refresh operations) automatically.
@@ -34,9 +62,10 @@ impl Database {
         let options = SqliteConnectOptions::from_str(&url)
             .map_err(DatabaseError::from_sqlx)?
             .pragma("busy_timeout", "5000");
-        // Pool sized for: 10 concurrent feed fetches + content loads + UI queries + headroom
+        // SQLite is single-writer; 5 connections covers 3-5 peak concurrent readers
+        // (feed fetches + content loads + UI queries).
         let pool = SqlitePoolOptions::new()
-            .max_connections(20)
+            .max_connections(5)
             .acquire_timeout(Duration::from_secs(10))
             .connect_with(options)
             .await
@@ -262,6 +291,20 @@ impl Database {
             .execute(&mut *tx)
             .await
             .ok(); // Ignore error if column already exists
+
+        // Create user preferences table (key-value store for user settings)
+        // Keys use dotted convention: theme.variant, keybind.quit, session.view, etc.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        "#,
+        )
+        .execute(&mut *tx)
+        .await?;
 
         // Commit all migrations atomically
         tx.commit().await?;
