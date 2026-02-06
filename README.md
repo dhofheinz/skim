@@ -12,10 +12,11 @@ A terminal RSS reader that fetches clean article content via jina.ai for distrac
 - **Subscribe by URL** - Discover and add feeds from any URL or HTML page
 - **Feed management** - Delete, rename, and organize feeds via context menu
 - **Categories** - Collapsible tree sidebar for grouping feeds into folders
-- **Offline-first** - Sync once, read without network
+- **Offline reading** - TTL-based content cache with per-feed prefetch
 - **Concurrent refresh** - Fetches 10 feeds simultaneously
 - **Markdown rendering** - Styled headings, code blocks, emphasis
-- **Search** - Global search across all feeds
+- **Full-text search** - Search titles, summaries, or cached article content with toggleable scope
+- **Reading stats** - Track reading sessions with per-day/week/month breakdowns
 - **OPML import/export** - Round-trip with category nesting preserved
 - **Persistent state** - Read/starred status saved in SQLite
 
@@ -61,11 +62,14 @@ Press `+` to subscribe to a feed by URL, or `m` on any feed for rename, move, de
 | `r` | Refresh all feeds |
 | `R` | Refresh selected feed |
 | `s` | Toggle star |
+| `S` | Toggle starred articles mode |
 | `o` | Open in browser |
 | `/` | Search |
 | `+` | Subscribe to feed by URL |
 | `d` | Delete selected feed |
 | `m` | Feed context menu (rename, move, delete, refresh, open) |
+| `P` | Prefetch articles for offline reading |
+| `I` | View reading stats |
 | `c` | Toggle category sidebar |
 | `e` | Export feeds to OPML |
 | `?` | Show help overlay |
@@ -98,7 +102,8 @@ Press `+` to subscribe to a feed by URL, or `m` on any feed for rename, move, de
 
 | Key | Action |
 |-----|--------|
-| Type | Filter articles by title/summary |
+| Type | Filter articles in real-time |
+| `Ctrl+S` | Toggle scope (title+summary / all content) |
 | `Enter` | Confirm search |
 | `Esc` | Cancel search |
 
