@@ -164,6 +164,26 @@ impl Database {
         Ok(rows.into_iter().map(ArticleDbRow::into_article).collect())
     }
 
+    /// Get a single article by its ID.
+    ///
+    /// Used by What's New panel navigation when the user selects an entry
+    /// and needs the full Article for the reader view.
+    pub async fn get_article_by_id(&self, article_id: i64) -> Result<Option<Article>> {
+        let row = sqlx::query_as::<_, ArticleDbRow>(
+            r#"
+            SELECT id, feed_id, guid, title, url, published, summary, content,
+                   read, starred, fetched_at
+            FROM articles
+            WHERE id = ?
+        "#,
+        )
+        .bind(article_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(ArticleDbRow::into_article))
+    }
+
     /// Returns all starred articles across all feeds.
     ///
     /// # Keybind
@@ -228,6 +248,31 @@ impl Database {
         .await?;
 
         Ok(result.0)
+    }
+
+    /// Mark all articles as read for a specific feed, returns count of articles marked
+    ///
+    /// Uses `WHERE read = 0` to make the operation idempotent. Only unread articles
+    /// are updated, avoiding unnecessary writes when called repeatedly.
+    #[allow(dead_code)] // Kept for future UI integration
+    pub async fn mark_all_read_for_feed(&self, feed_id: i64) -> Result<u64> {
+        let result = sqlx::query("UPDATE articles SET read = 1 WHERE feed_id = ? AND read = 0")
+            .bind(feed_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Mark all articles as read across all feeds, returns count of articles marked
+    ///
+    /// Uses `WHERE read = 0` to make the operation idempotent. Only unread articles
+    /// are updated, avoiding unnecessary writes when called repeatedly.
+    #[allow(dead_code)] // Kept for future UI integration
+    pub async fn mark_all_read(&self) -> Result<u64> {
+        let result = sqlx::query("UPDATE articles SET read = 1 WHERE read = 0")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     // ========================================================================
@@ -527,5 +572,178 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(limited.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_mark_all_read_for_feed() {
+        let db = test_db().await;
+        db.sync_feeds(&[test_feed(1), test_feed(2)]).await.unwrap();
+        let feeds = db.get_feeds_with_unread_counts().await.unwrap();
+
+        db.upsert_articles(
+            feeds[0].id,
+            &[
+                test_article("1", "Article 1"),
+                test_article("2", "Article 2"),
+                test_article("3", "Article 3"),
+            ],
+        )
+        .await
+        .unwrap();
+
+        db.upsert_articles(feeds[1].id, &[test_article("4", "Article 4")])
+            .await
+            .unwrap();
+
+        let articles = db.get_articles_for_feed(feeds[0].id, None).await.unwrap();
+        db.mark_article_read(articles[0].id).await.unwrap();
+
+        let count = db.mark_all_read_for_feed(feeds[0].id).await.unwrap();
+        assert_eq!(count, 2);
+
+        let articles = db.get_articles_for_feed(feeds[0].id, None).await.unwrap();
+        assert!(articles.iter().all(|a| a.read));
+
+        let articles = db.get_articles_for_feed(feeds[1].id, None).await.unwrap();
+        assert!(articles.iter().all(|a| !a.read));
+    }
+
+    #[tokio::test]
+    async fn test_mark_all_read_for_feed_idempotent() {
+        let db = test_db().await;
+        db.sync_feeds(&[test_feed(1)]).await.unwrap();
+        let feeds = db.get_feeds_with_unread_counts().await.unwrap();
+
+        db.upsert_articles(
+            feeds[0].id,
+            &[
+                test_article("1", "Article 1"),
+                test_article("2", "Article 2"),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let count = db.mark_all_read_for_feed(feeds[0].id).await.unwrap();
+        assert_eq!(count, 2);
+
+        let count = db.mark_all_read_for_feed(feeds[0].id).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_mark_all_read() {
+        let db = test_db().await;
+        db.sync_feeds(&[test_feed(1), test_feed(2)]).await.unwrap();
+        let feeds = db.get_feeds_with_unread_counts().await.unwrap();
+
+        db.upsert_articles(
+            feeds[0].id,
+            &[
+                test_article("1", "Article 1"),
+                test_article("2", "Article 2"),
+            ],
+        )
+        .await
+        .unwrap();
+
+        db.upsert_articles(
+            feeds[1].id,
+            &[
+                test_article("3", "Article 3"),
+                test_article("4", "Article 4"),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let count = db.mark_all_read().await.unwrap();
+        assert_eq!(count, 4);
+
+        let articles = db.get_articles_for_feed(feeds[0].id, None).await.unwrap();
+        assert!(articles.iter().all(|a| a.read));
+
+        let articles = db.get_articles_for_feed(feeds[1].id, None).await.unwrap();
+        assert!(articles.iter().all(|a| a.read));
+    }
+
+    #[tokio::test]
+    async fn test_mark_all_read_idempotent() {
+        let db = test_db().await;
+        db.sync_feeds(&[test_feed(1)]).await.unwrap();
+        let feeds = db.get_feeds_with_unread_counts().await.unwrap();
+
+        db.upsert_articles(feeds[0].id, &[test_article("1", "Article 1")])
+            .await
+            .unwrap();
+
+        let count = db.mark_all_read().await.unwrap();
+        assert_eq!(count, 1);
+
+        let count = db.mark_all_read().await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_mark_all_read_for_feed_empty() {
+        let db = test_db().await;
+        db.sync_feeds(&[test_feed(1)]).await.unwrap();
+        let feeds = db.get_feeds_with_unread_counts().await.unwrap();
+
+        // Feed has zero articles — should be a no-op
+        let count = db.mark_all_read_for_feed(feeds[0].id).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_unread_counts_after_bulk_mark_read() {
+        let db = test_db().await;
+        db.sync_feeds(&[test_feed(1), test_feed(2)]).await.unwrap();
+        let feeds = db.get_feeds_with_unread_counts().await.unwrap();
+
+        db.upsert_articles(
+            feeds[0].id,
+            &[
+                test_article("1", "Article 1"),
+                test_article("2", "Article 2"),
+                test_article("3", "Article 3"),
+            ],
+        )
+        .await
+        .unwrap();
+
+        db.upsert_articles(
+            feeds[1].id,
+            &[
+                test_article("4", "Article 4"),
+                test_article("5", "Article 5"),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // Verify initial unread counts
+        let feeds = db.get_feeds_with_unread_counts().await.unwrap();
+        let feed1 = feeds.iter().find(|f| &*f.title == "Test Feed 1").unwrap();
+        let feed2 = feeds.iter().find(|f| &*f.title == "Test Feed 2").unwrap();
+        assert_eq!(feed1.unread_count, 3);
+        assert_eq!(feed2.unread_count, 2);
+
+        // Mark feed 1 as read
+        db.mark_all_read_for_feed(feed1.id).await.unwrap();
+
+        // Verify counts: feed 1 should be 0, feed 2 unchanged
+        let feeds = db.get_feeds_with_unread_counts().await.unwrap();
+        let feed1 = feeds.iter().find(|f| &*f.title == "Test Feed 1").unwrap();
+        let feed2 = feeds.iter().find(|f| &*f.title == "Test Feed 2").unwrap();
+        assert_eq!(feed1.unread_count, 0);
+        assert_eq!(feed2.unread_count, 2);
+
+        // Mark all as read
+        db.mark_all_read().await.unwrap();
+
+        // Verify all counts are 0
+        let feeds = db.get_feeds_with_unread_counts().await.unwrap();
+        assert!(feeds.iter().all(|f| f.unread_count == 0));
     }
 }

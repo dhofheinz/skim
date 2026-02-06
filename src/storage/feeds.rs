@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use super::schema::Database;
 use super::types::{DatabaseError, Feed, FeedRow, OpmlFeed, ParsedArticle};
+use crate::util::strip_control_chars;
 
 impl Database {
     // ========================================================================
@@ -43,6 +44,7 @@ impl Database {
 
     /// Get all feeds with their unread article counts
     pub async fn get_feeds_with_unread_counts(&self) -> Result<Vec<Feed>> {
+        // Served by idx_articles_feed_read(feed_id, read) for efficient unread count aggregation
         let rows: Vec<FeedRow> = sqlx::query_as(
             r#"
                 SELECT
@@ -58,6 +60,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
+        // SEC-001: Sanitize all external string fields at the DB boundary
         let feeds = rows
             .into_iter()
             .map(
@@ -72,9 +75,9 @@ impl Database {
                     consecutive_failures,
                 )| Feed {
                     id,
-                    title: Arc::from(title),
-                    url,
-                    html_url,
+                    title: Arc::from(strip_control_chars(&title)),
+                    url: strip_control_chars(&url).into_owned(),
+                    html_url: html_url.map(|h| strip_control_chars(&h).into_owned()),
                     last_fetched,
                     error,
                     unread_count,
@@ -152,6 +155,23 @@ impl Database {
         Ok(())
     }
 
+    /// Get all feeds formatted for OPML export, ordered alphabetically by title.
+    pub async fn get_feeds_for_export(&self) -> Result<Vec<OpmlFeed>> {
+        let rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as("SELECT title, url, html_url FROM feeds ORDER BY title COLLATE NOCASE")
+                .fetch_all(&self.pool)
+                .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(title, url, html_url)| OpmlFeed {
+                title,
+                xml_url: url,
+                html_url,
+            })
+            .collect())
+    }
+
     // ========================================================================
     // Circuit Breaker Operations
     // ========================================================================
@@ -212,6 +232,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
+        // SEC-001: Sanitize all external string fields at the DB boundary
         let feeds = rows
             .into_iter()
             .map(
@@ -226,9 +247,9 @@ impl Database {
                     consecutive_failures,
                 )| Feed {
                     id,
-                    title: Arc::from(title),
-                    url,
-                    html_url,
+                    title: Arc::from(strip_control_chars(&title)),
+                    url: strip_control_chars(&url).into_owned(),
+                    html_url: html_url.map(|h| strip_control_chars(&h).into_owned()),
                     last_fetched,
                     error,
                     unread_count,
@@ -365,31 +386,6 @@ impl Database {
         // within the same transaction as article inserts/updates/deletes.
         // SQLite guarantees atomicity: if commit succeeds, both articles and FTS are consistent.
         tx.commit().await?;
-
-        // Verify FTS consistency after commit (defensive check against trigger failures)
-        // This catches edge cases like disk full during trigger execution where SQLite
-        // might succeed on main table but fail silently on FTS virtual table.
-        let article_count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM articles WHERE feed_id = ?")
-                .bind(feed_id)
-                .fetch_one(&self.pool)
-                .await?;
-
-        let fts_count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM articles_fts WHERE rowid IN (SELECT id FROM articles WHERE feed_id = ?)",
-        )
-        .bind(feed_id)
-        .fetch_one(&self.pool)
-        .await?;
-
-        if article_count.0 != fts_count.0 {
-            tracing::warn!(
-                feed_id = feed_id,
-                articles = article_count.0,
-                fts_entries = fts_count.0,
-                "FTS index may be inconsistent after refresh, consider --rebuild-search"
-            );
-        }
 
         Ok(total_inserted)
     }
@@ -635,6 +631,48 @@ mod tests {
         let existing = stored.iter().find(|a| a.guid == "existing").unwrap();
         assert!(existing.read, "Read status should be preserved");
         assert_eq!(&*existing.title, "Updated Title");
+    }
+
+    // ========================================================================
+    // Export Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_get_feeds_for_export() {
+        let db = test_db().await;
+        let feeds = vec![
+            OpmlFeed {
+                title: "Zebra Blog".to_string(),
+                xml_url: "https://zebra.example.com/rss".to_string(),
+                html_url: Some("https://zebra.example.com".to_string()),
+            },
+            OpmlFeed {
+                title: "Alpha News".to_string(),
+                xml_url: "https://alpha.example.com/rss".to_string(),
+                html_url: None,
+            },
+        ];
+        db.sync_feeds(&feeds).await.unwrap();
+
+        let exported = db.get_feeds_for_export().await.unwrap();
+        assert_eq!(exported.len(), 2);
+        // Should be sorted alphabetically (case-insensitive)
+        assert_eq!(exported[0].title, "Alpha News");
+        assert_eq!(exported[0].xml_url, "https://alpha.example.com/rss");
+        assert_eq!(exported[0].html_url, None);
+        assert_eq!(exported[1].title, "Zebra Blog");
+        assert_eq!(exported[1].xml_url, "https://zebra.example.com/rss");
+        assert_eq!(
+            exported[1].html_url,
+            Some("https://zebra.example.com".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_feeds_for_export_empty() {
+        let db = test_db().await;
+        let exported = db.get_feeds_for_export().await.unwrap();
+        assert!(exported.is_empty());
     }
 
     // ========================================================================
