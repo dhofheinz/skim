@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use thiserror::Error;
 
+use crate::util::strip_control_chars;
+
 // ============================================================================
 // Error Types
 // ============================================================================
@@ -24,16 +26,20 @@ pub enum DatabaseError {
 impl DatabaseError {
     /// Check if a sqlx error indicates database locking
     pub(crate) fn from_sqlx(err: sqlx::Error) -> Self {
-        let error_string = err.to_string().to_lowercase();
+        // Primary: check structured error codes (reliable across SQLite versions)
+        if let sqlx::Error::Database(ref db_err) = err {
+            if let Some(code) = db_err.code() {
+                match code.as_ref() {
+                    "5" | "6" => return DatabaseError::InstanceLocked, // BUSY | LOCKED
+                    _ => {}
+                }
+            }
+        }
 
-        // Check for SQLite lock-related error messages
-        // SQLITE_BUSY (5): database is locked
-        // SQLITE_LOCKED (6): database table is locked
-        // SQLITE_CANTOPEN (14): unable to open database file
+        // Fallback: string matching for edge cases (connection errors, CANTOPEN)
+        let error_string = err.to_string().to_lowercase();
         if error_string.contains("database is locked")
             || error_string.contains("database table is locked")
-            || error_string.contains("sqlite_busy")
-            || error_string.contains("sqlite_locked")
             || error_string.contains("unable to open database file")
         {
             return DatabaseError::InstanceLocked;
@@ -118,16 +124,19 @@ pub(crate) struct ArticleDbRow {
 }
 
 impl ArticleDbRow {
+    /// SEC-001: Sanitizes all external string fields at the DB boundary.
+    /// P-9: strip_control_chars uses a byte-scan fast path — for already-clean content
+    /// it returns Cow::Borrowed with no allocation, making repeated calls negligible.
     pub(crate) fn into_article(self) -> Article {
         Article {
             id: self.id,
             feed_id: self.feed_id,
             guid: self.guid,
-            title: Arc::from(self.title),
-            url: self.url.map(Arc::from),
+            title: Arc::from(strip_control_chars(&self.title)),
+            url: self.url.map(|u| Arc::from(strip_control_chars(&u))),
             published: self.published,
-            summary: self.summary.map(Arc::from),
-            content: self.content.map(Arc::from),
+            summary: self.summary.map(|s| Arc::from(strip_control_chars(&s))),
+            content: self.content.map(|c| Arc::from(strip_control_chars(&c))),
             read: self.read,
             starred: self.starred,
             fetched_at: self.fetched_at,
@@ -152,6 +161,7 @@ pub(crate) struct ArticleRow {
 }
 
 impl ArticleRow {
+    /// SEC-001: Sanitizes all external string fields at the DB boundary
     pub(crate) fn into_tuple(self) -> (i64, Article) {
         (
             self.feed_id,
@@ -159,11 +169,11 @@ impl ArticleRow {
                 id: self.id,
                 feed_id: self.feed_id,
                 guid: self.guid,
-                title: Arc::from(self.title),
-                url: self.url.map(Arc::from),
+                title: Arc::from(strip_control_chars(&self.title)),
+                url: self.url.map(|u| Arc::from(strip_control_chars(&u))),
                 published: self.published,
-                summary: self.summary.map(Arc::from),
-                content: self.content.map(Arc::from),
+                summary: self.summary.map(|s| Arc::from(strip_control_chars(&s))),
+                content: self.content.map(|c| Arc::from(strip_control_chars(&c))),
                 read: self.read,
                 starred: self.starred,
                 fetched_at: self.fetched_at,
@@ -219,4 +229,122 @@ pub struct Article {
     pub read: bool,
     pub starred: bool,
     pub fetched_at: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DatabaseError;
+    use std::borrow::Cow;
+    use std::fmt;
+
+    /// Mock SQLite database error for testing error code matching
+    #[derive(Debug)]
+    struct MockDbError {
+        message: String,
+        code: Option<String>,
+    }
+
+    impl fmt::Display for MockDbError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+
+    impl std::error::Error for MockDbError {}
+
+    impl sqlx::error::DatabaseError for MockDbError {
+        fn message(&self) -> &str {
+            &self.message
+        }
+
+        fn code(&self) -> Option<Cow<'_, str>> {
+            self.code.as_deref().map(Cow::Borrowed)
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+    }
+
+    fn db_error(message: &str, code: Option<&str>) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(MockDbError {
+            message: message.to_string(),
+            code: code.map(String::from),
+        }))
+    }
+
+    #[test]
+    fn test_error_code_5_returns_instance_locked() {
+        let err = db_error("database is locked", Some("5"));
+        assert!(matches!(
+            DatabaseError::from_sqlx(err),
+            DatabaseError::InstanceLocked
+        ));
+    }
+
+    #[test]
+    fn test_error_code_6_returns_instance_locked() {
+        let err = db_error("database table is locked", Some("6"));
+        assert!(matches!(
+            DatabaseError::from_sqlx(err),
+            DatabaseError::InstanceLocked
+        ));
+    }
+
+    #[test]
+    fn test_unknown_code_with_lock_message_falls_through_to_string_match() {
+        let err = db_error("database is locked", Some("99"));
+        assert!(matches!(
+            DatabaseError::from_sqlx(err),
+            DatabaseError::InstanceLocked
+        ));
+    }
+
+    #[test]
+    fn test_no_code_with_lock_message_falls_through_to_string_match() {
+        let err = db_error("database is locked", None);
+        assert!(matches!(
+            DatabaseError::from_sqlx(err),
+            DatabaseError::InstanceLocked
+        ));
+    }
+
+    #[test]
+    fn test_cantopen_message_returns_instance_locked() {
+        let err = db_error("unable to open database file", Some("14"));
+        assert!(matches!(
+            DatabaseError::from_sqlx(err),
+            DatabaseError::InstanceLocked
+        ));
+    }
+
+    #[test]
+    fn test_unrelated_error_returns_other() {
+        let err = db_error("syntax error near SELECT", Some("1"));
+        assert!(matches!(
+            DatabaseError::from_sqlx(err),
+            DatabaseError::Other(_)
+        ));
+    }
+
+    #[test]
+    fn test_non_database_error_variant_returns_other() {
+        let err = sqlx::Error::PoolTimedOut;
+        assert!(matches!(
+            DatabaseError::from_sqlx(err),
+            DatabaseError::Other(_)
+        ));
+    }
 }
